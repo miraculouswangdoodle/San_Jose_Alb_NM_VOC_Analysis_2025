@@ -1,3 +1,35 @@
+"""
+CYL07-A2 File Organizer
+=======================
+Collects CYL07-A2 calibration cylinder .Chrom files from a nested monthly
+folder structure and copies them into a single flat destination folder for
+easier batch processing.
+
+Usage:
+    Run the script and enter the path to the root source folder when prompted.
+
+        python CYL07A2_organizer.py
+
+Expected folder structure:
+    root_source/
+        01/          <- main folder (day or run number, zero-padded 01-31)
+            01/      <- subfolder (zero-padded 01-31)
+                YYYYMMDD_HHMM_CYL07-A2_*.Chrom
+            02/
+                ...
+        02/
+            ...
+
+Output:
+    A new folder named "CYL07-A2 files_<root_folder_name>" is created as a
+    sibling of root_source. All matching .Chrom files are copied there in a
+    flat structure, sorted by filename (chronological order). Files that
+    already exist in the destination are skipped.
+
+Dependencies:
+    Standard library only (os, shutil, pathlib). No additional packages required.
+"""
+
 import os
 import shutil
 from pathlib import Path
