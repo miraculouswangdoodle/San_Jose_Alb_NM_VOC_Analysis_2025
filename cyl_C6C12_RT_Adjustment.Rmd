@@ -1,0 +1,868 @@
+---
+title: "C6C12 RT Adjustment File Formatter"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    code_folding: show
+    theme: cosmo
+---
+
+## Overview
+
+This script processes C6C12 retention time (RT) adjustment Excel files and
+formats them for use with the MethodManager Python automation script. It is
+designed to be run on a folder of input files, one per calibration date.
+
+**What this script does:**
+
+1. Reads input Excel files (one sheet named "valid") containing compound names
+   and observed R.Time values from a GC calibration run
+2. Joins observed R.Time values to a hardcoded reference table of all 92 C6C12
+   compounds and their baseline RT windows (OldMin, OldMax, OldMid)
+3. Calculates the RT shift (adjustment) as: observed R.Time - OldMid
+4. Applies the shift to calculate new RT windows (New Rt MIN, New Rt MAX)
+5. Sets New Rt MIN and New Rt MAX to 0 for compounds absent from the input file
+6. Writes output Excel files formatted for the MethodManager Python script
+
+**Python script requirements for output files:**
+
+- Row 3: Column headers (Python reads headers from this row)
+- Rows 4-7: Empty (spacer rows expected by Python)
+- Rows 8-99: All 92 C6C12 compounds, starting with ACETALDEHYDE
+- Column named "Name": compound names (Python identifies compounds here)
+- Column named "New Rt MIN": RT minimum values (Python finds by "RT"+"MIN")
+- Column named "New Rt MAX": RT maximum values (Python finds by "RT"+"MAX")
+- Values of 0 for MIN/MAX tell Python to skip that compound in MethodManager
+
+**Dependencies (files needed to run this script):**
+
+- Input folder containing one or more Excel files matching the pattern:
+  `C6C12_YYYY_MM_DD.xlsx` (e.g., C6C12_2024_03_15.xlsx)
+- Each input file must have a sheet named "valid" (configurable below) with:
+  - A column named "Name" containing compound names matching the reference table
+  - A column named "R.Time" containing observed retention times (in seconds)
+  - Column headers in row 3 (rows 1-2 are skipped on read)
+- No external reference files are required; the 92-compound table is built in
+
+---
+
+## User Configuration
+
+**Edit only this section before running.**
+
+```{r setup, echo=TRUE, warning=FALSE, message=FALSE}
+
+# ------------------------------------------------------------------------------
+# LOAD REQUIRED LIBRARIES
+# ------------------------------------------------------------------------------
+# tidyverse: provides dplyr (data manipulation), stringr (string ops), readr
+# readxl:   reads .xlsx input files
+# writexl:  writes .xlsx output files (use writexl, NOT openxlsx, for Python
+#           compatibility — openxlsx adds drawing XML that breaks openpyxl)
+# ------------------------------------------------------------------------------
+
+library(tidyverse)
+library(readxl)
+library(writexl)
+
+# ==============================================================================
+# USER CONFIGURATION — edit these parameters before running
+# ==============================================================================
+
+# Full path to the folder containing your C6C12_YYYY_MM_DD.xlsx input files.
+# Use forward slashes (/) even on Windows, or escaped backslashes (\\).
+# Example: "C:/Users/yourname/Documents/RT Adjustment C6C12"
+input_dir <- "YOUR/INPUT/FOLDER/PATH/HERE"
+
+# Output directory for processed files.
+# NULL means output files will be saved to the same folder as the input files.
+# To save elsewhere, replace NULL with a quoted path string.
+output_dir <- NULL
+
+# Regex pattern used to identify valid input files in the input folder.
+# Default matches filenames like: C6C12_2024_03_15.xlsx
+# Only change this if your file naming convention differs.
+file_pattern <- "^C6C12_\\d{4}_\\d{2}_\\d{2}\\.xlsx$"
+
+# Name of the sheet in each input Excel file that contains compound data.
+# Default is "valid". Change if your sheet is named differently.
+input_sheet <- "valid"
+
+# Column name in the input sheet containing compound names.
+# These names must exactly match the reference table built into this script.
+input_name_col <- "Name"
+
+# Column name in the input sheet containing observed retention times (seconds).
+input_rtime_col <- "R.Time"
+
+# ==============================================================================
+```
+
+---
+
+## Reference Compound Table
+
+This table is hardcoded and defines all 92 C6C12 compounds along with their
+baseline RT window boundaries. It serves as the "master list" that every input
+file is compared against.
+
+- **OldMin / OldMax**: baseline RT window edges (seconds)
+- **DRt**: window width (OldMax - OldMin)
+- **OldMid**: baseline window midpoint; used to calculate the RT shift
+
+Compounds present in the input file will have their windows shifted by:
+`adjustment = round(observed R.Time - OldMid)`
+
+Compounds absent from the input file will have New Rt MIN = 0 and New Rt MAX = 0,
+which tells the Python script to skip them in MethodManager.
+
+```{r reference_table, echo=TRUE, warning=FALSE, message=FALSE}
+
+# Build the reference table for all 92 C6C12 compounds.
+# Column order: Name, OldMin, OldMax, DRt (window width), OldMid (midpoint).
+# Do not reorder or rename columns — downstream calculations depend on these names.
+
+ref_compounds <- tibble::tribble(
+  ~Name,                ~OldMin, ~OldMax, ~DRt, ~OldMid,
+  "ACETALDEHYDE",       14,      22,      8,    18,
+  "CHLOROETHANE",       22,      30,      8,    26,
+  "CHLOROMETHANE",      30,      38,      8,    34,
+  "N-BUTANE",           47,      57,      10,   52,
+  "ACROLEIN",           86,      96,      10,   91,
+  "ACETONE",            96,      106,     10,   101,
+  "PROPANAL",           111,     113,     2,    112,
+  "N-PENTANE",          113,     123,     10,   118,
+  "DICHLOROMETHANE",    185,     195,     10,   190,
+  "2,2-DIME-BUTANE",    195,     215,     20,   205,
+  "2-METHYLPROPENAL",   210,     220,     10,   215,
+  "1,1-DICHLOROETHANE", 250,     260,     10,   255,
+  "MTBE",               257,     267,     10,   262,
+  "VINYLACETATE",       265,     275,     10,   270,
+  "2-ME-PENTANE",       275,     285,     10,   280,
+  "T-1-2-DICL-ETHENE",  285,     295,     10,   290,
+  "MEK",                304,     314,     10,   309,
+  "C-1,2-DICL-ETHENE",  353,     363,     10,   358,
+  "N-HEXANE",           366,     376,     10,   371,
+  "CHLOROFORME",        375,     385,     10,   380,
+  "THF",                429,     439,     10,   434,
+  "CROTONALDEHYDE",     451,     461,     10,   456,
+  "ME-CYCLOPENTANE",    467,     477,     10,   472,
+  "1-2DICHLOROETHANE",  473,     483,     10,   478,
+  "111-TriCL-ETHANE",   503,     513,     10,   508,
+  "BENZENE",            562,     582,     20,   572,
+  "CCI4",               582,     602,     20,   592,
+  "CYCLOHEXANE",        602,     622,     20,   612,
+  "2-ME-HEXANE",        640,     650,     10,   645,
+  "3-ME-HEXANE",        681,     691,     10,   686,
+  "1-2-DICL-PROPANE",   699,     709,     10,   704,
+  "PENTANAL",           709,     712,     3,    710.5,
+  "BROMO-DICL-METHAN",  726,     737,     11,   731.5,
+  "TRICHLOROETHENE",    736,     745,     9,    740.5,
+  "224-TME-PENTANE",    740,     750,     10,   745,
+  "1-4-DIOXANE",        745,     750,     5,    747.5,
+  "ME-METHACRYLATE",    776,     786,     10,   781,
+  "N-HEPTANE",          786,     798,     12,   792,
+  "T-1-3-DICL-PROPEN",  876,     888,     12,   882,
+  "ME-CYCLOHEXANE",     884,     894,     10,   889,
+  "MIBK",               886,     890,     4,    888,
+  "C-1-3-DICL-PROPEN",  954,     970,     16,   962,
+  "112-TriCL-ETHANE",   976,     992,     16,   984,
+  "234-TME-PENTANE",    990,     1010,    20,   1000,
+  "TOLUENE",            1020,    1030,    10,   1025,
+  "2-ME-HEPTANE",       1050,    1064,    14,   1057,
+  "MBK",                1065,    1075,    10,   1070,
+  "DIBR-CL-METHANE",    1078,    1084,    6,    1081,
+  "3-ME-HEPTANE",       1078,    1090,    12,   1084,
+  "HEXANAL",            1089,    1099,    10,   1094,
+  "1-2DIBROMOETHANE",   1109,    1119,    10,   1114,
+  "N-OCTANE",           1165,    1177,    12,   1171,
+  "TETRACHLORORETHENE", 1176,    1186,    10,   1181,
+  "FURFURAL",           1238,    1248,    10,   1243,
+  "CHLOROBENZENE",      1263,    1283,    20,   1273,
+  "ETHYLBENZENE",       1315,    1335,    20,   1325,
+  "M&P-XYLENES",        1344,    1364,    20,   1354,
+  "BROMOFORM",          1355,    1367,    12,   1361,
+  "STYRENE",            1391,    1403,    12,   1397,
+  "O-XYLENE",           1404,    1416,    12,   1410,
+  "1122TetraCL-ETHAN",  1416,    1422,    6,    1419,
+  "N-NONANE",           1435,    1455,    20,   1445,
+  "I-PROPYLBENZENE",    1478,    1498,    20,   1488,
+  "BENZALDEHYDE",       1510,    1520,    10,   1515,
+  "a-PINENE",           1530,    1542,    12,   1536,
+  "2-CHLORO-TOLUENE",   1544,    1554,    10,   1549,
+  "N-PROPYLBENZENE",    1550,    1560,    10,   1555,
+  "M-ETHYLTOLUENE",     1566,    1574,    8,    1570,
+  "P-ETHYLTOLUENE",     1572,    1580,    8,    1576,
+  "135-TMB",            1580,    1594,    14,   1587,
+  "O-ETHYLTOLUENE",     1605,    1619,    14,   1612,
+  "b-PINENE",           1618,    1632,    14,   1625,
+  "124-TMB",            1637,    1647,    10,   1642,
+  "BENZYLCHLORIDE",     1659,    1663,    4,    1661,
+  "1-3-DICL-BENZENE",   1659,    1663,    4,    1661,
+  "N-DECANE",           1657,    1667,    10,   1662,
+  "1-4-DICL-BENZENE",   1667,    1677,    10,   1672,
+  "3-CARENE",           1685,    1695,    10,   1690,
+  "123-TMB",            1696,    1708,    12,   1702,
+  "1-2-DICL-BENZENE",   1716,    1726,    10,   1721,
+  "LIMONENE",           1720,    1730,    10,   1725,
+  "M-DIETHYLBENZENE",   1745,    1755,    10,   1750,
+  "P-DIETHYLBENZENE",   1759,    1769,    10,   1764,
+  "M-TOLUALDEHYDE",     1769,    1779,    10,   1774,
+  "N-UNDECANE",         1838,    1858,    20,   1848,
+  "124-TriCL-BENZENE",  2006,    2020,    14,   2013,
+  "NAPHTHALENE",        2030,    2040,    10,   2035,
+  "N-DODECANE",         2038,    2058,    20,   2048,
+  "HexCL-1-3BUTADIEN",  2106,    2126,    20,   2116,
+  "N-TRIDECANE",        2174,    2194,    20,   2184,
+  "2-ME-NAPHTHALENE",   2254,    2274,    20,   2264,
+  "1-ME-NAPHTHALENE",   2299,    2319,    20,   2309
+)
+
+# Quick sanity check — should print 92 compounds, first = ACETALDEHYDE,
+# last = 1-ME-NAPHTHALENE. If these differ, the reference table has been altered.
+cat("Reference table contains", nrow(ref_compounds), "compounds\n")
+cat("First compound:", ref_compounds$Name[1], "\n")
+cat("Last compound: ", ref_compounds$Name[nrow(ref_compounds)], "\n")
+```
+
+---
+
+## File Discovery
+
+```{r file_discovery, echo=TRUE, warning=FALSE, message=FALSE}
+
+# ------------------------------------------------------------------------------
+# RESOLVE OUTPUT DIRECTORY
+# If output_dir was left as NULL in User Configuration, save outputs alongside
+# the input files. Otherwise, create the specified output directory if needed.
+# ------------------------------------------------------------------------------
+
+if (is.null(output_dir)) {
+  output_dir <- input_dir
+} else if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+  cat("Created output directory:", output_dir, "\n")
+}
+
+# ------------------------------------------------------------------------------
+# CHECK INPUT DIRECTORY EXISTS
+# Stops immediately with a clear message if the path is wrong, rather than
+# producing a cryptic downstream error.
+# ------------------------------------------------------------------------------
+
+if (!dir.exists(input_dir)) {
+  stop(
+    "Input directory not found: ", input_dir,
+    "\nPlease check the input_dir path in the User Configuration section."
+  )
+}
+
+# ------------------------------------------------------------------------------
+# FIND MATCHING INPUT FILES
+# list.files() searches the input folder for filenames matching file_pattern.
+# full.names = TRUE returns complete file paths for use in read_excel() later.
+# ignore.case = TRUE makes the match case-insensitive (e.g., .XLSX = .xlsx).
+# ------------------------------------------------------------------------------
+
+all_files <- list.files(
+  path        = input_dir,
+  pattern     = file_pattern,
+  full.names  = TRUE,
+  ignore.case = TRUE
+)
+
+# Extract just filenames for display (not full paths)
+file_names <- basename(all_files)
+
+cat(paste0(strrep("=", 62), "\n"))
+cat("FILE DISCOVERY\n")
+cat(paste0(strrep("=", 62), "\n"))
+cat("Input directory:", input_dir, "\n")
+cat("File pattern:   ", file_pattern, "\n")
+cat("Files found:    ", length(all_files), "\n\n")
+
+# Stop if no files match — better to fail early with a clear message than to
+# silently produce no output
+if (length(all_files) == 0) {
+  stop(
+    "No files found matching pattern '", file_pattern, "' in:\n", input_dir,
+    "\nCheck that your files are named C6C12_YYYY_MM_DD.xlsx ",
+    "and that input_dir is correct."
+  )
+}
+
+cat("Files to process:\n")
+for (i in seq_along(file_names)) {
+  cat(sprintf("  %2d. %s\n", i, file_names[i]))
+}
+cat("\n")
+```
+
+---
+
+## Processing Functions
+
+Three functions handle the core logic. They are defined here and called in the
+next section. Separating functions from the processing loop makes it easier to
+debug individual steps.
+
+```{r functions, echo=TRUE, warning=FALSE, message=FALSE}
+
+# ==============================================================================
+# FUNCTION 1: validate_compounds()
+#
+# Checks that every compound name in the input file exactly matches a name in
+# the reference table. Mismatches will cause a left_join() to silently drop
+# rows, producing incorrect output — so we catch them here first.
+#
+# Arguments:
+#   input_compounds  character vector of compound names read from the input file
+#   ref_compounds    the 92-row reference tibble defined above
+#
+# Returns a list with:
+#   $valid       TRUE if all input names are in the reference table
+#   $input_count number of unique compound names in the input file
+#   $not_in_ref  character vector of input names that have no reference match
+#                (empty if $valid is TRUE)
+# ==============================================================================
+
+validate_compounds <- function(input_compounds, ref_compounds) {
+
+  input_names <- unique(input_compounds)
+  ref_names   <- ref_compounds$Name
+
+  # setdiff(A, B) returns elements in A that are not in B
+  not_in_ref <- setdiff(input_names, ref_names)
+
+  list(
+    valid       = length(not_in_ref) == 0,
+    input_count = length(input_names),
+    not_in_ref  = not_in_ref
+  )
+}
+
+
+# ==============================================================================
+# FUNCTION 2: process_file()
+#
+# Reads one input Excel file, validates compound names, calculates RT
+# adjustments, and returns a formatted 92-row output tibble.
+#
+# Arguments:
+#   file_path       full path to the input .xlsx file
+#   ref_compounds   the 92-row reference tibble
+#   input_sheet     name of the sheet to read (default: "valid")
+#   input_name_col  column name containing compound names (default: "Name")
+#   input_rtime_col column name containing observed RT values (default: "R.Time")
+#
+# Returns a list with:
+#   $file_name       basename of the input file
+#   $success         TRUE if processing completed without errors
+#   $error           error message string if $success is FALSE, else NULL
+#   $compounds_found number of compounds matched between input and reference
+#   $compounds_total total compounds in reference table (always 92)
+#   $output_data     formatted 92-row tibble ready to write (if $success TRUE)
+# ==============================================================================
+
+process_file <- function(file_path,
+                         ref_compounds,
+                         input_sheet,
+                         input_name_col,
+                         input_rtime_col) {
+
+  file_name <- basename(file_path)
+
+  cat("\n", strrep("=", 62), "\n", sep = "")
+  cat("Processing:", file_name, "\n")
+  cat(strrep("=", 62), "\n")
+
+  # Initialise a result object. Default is failure; overwritten on success.
+  result <- list(
+    file_name       = file_name,
+    success         = FALSE,
+    error           = NULL,
+    compounds_found = 0,
+    compounds_total = nrow(ref_compounds),
+    output_data     = NULL
+  )
+
+  # Wrap everything in tryCatch so one bad file doesn't abort the whole batch.
+  # On error the message is stored in result$error and we move on.
+  tryCatch({
+
+    # --------------------------------------------------------------------------
+    # STEP 1: Read the input sheet
+    # skip = 2 skips rows 1-2 so row 3 becomes the header row, matching the
+    # Vistachrom export format expected by this workflow.
+    # --------------------------------------------------------------------------
+    cat("Reading sheet '", input_sheet, "' from input file...\n", sep = "")
+
+    input_data <- read_excel(
+      path  = file_path,
+      sheet = input_sheet,
+      skip  = 2   # Rows 1-2 skipped; row 3 treated as column headers
+    )
+
+    # Confirm required columns are present before attempting to use them
+    if (!input_name_col %in% names(input_data)) {
+      stop("Column '", input_name_col, "' not found. ",
+           "Available columns: ", paste(names(input_data), collapse = ", "))
+    }
+    if (!input_rtime_col %in% names(input_data)) {
+      stop("Column '", input_rtime_col, "' not found. ",
+           "Available columns: ", paste(names(input_data), collapse = ", "))
+    }
+
+    # --------------------------------------------------------------------------
+    # STEP 2: Extract and clean compound data
+    # Select only the two columns we need, drop any rows missing Name or R.Time
+    # (blank rows at the bottom of the sheet), and trim whitespace from names.
+    # --------------------------------------------------------------------------
+    compound_data <- input_data %>%
+      select(
+        Name   = all_of(input_name_col),
+        R.Time = all_of(input_rtime_col)
+      ) %>%
+      filter(!is.na(Name), !is.na(R.Time)) %>%
+      mutate(Name = str_trim(Name))   # Remove leading/trailing spaces
+
+    cat("Compounds found in input file:", nrow(compound_data), "\n")
+
+    # --------------------------------------------------------------------------
+    # STEP 3: Validate compound names
+    # Every name in the input must exactly match the reference table. Even one
+    # mismatch (e.g. extra space, different capitalisation) will cause that
+    # compound to be treated as absent (zeroed out) — so we stop and report it.
+    # --------------------------------------------------------------------------
+    validation <- validate_compounds(compound_data$Name, ref_compounds)
+
+    if (!validation$valid) {
+      cat("\n*** VALIDATION ERROR: Unrecognised compound names ***\n")
+      cat("The following names in the input file do not match the reference table:\n")
+      for (nm in validation$not_in_ref) {
+        cat("  - '", nm, "'\n", sep = "")
+      }
+      cat("\nTip: Check for extra spaces, capitalisation differences, or typos.\n")
+      cat("Reference table names are all-caps with specific punctuation.\n\n")
+      stop("Compound name validation failed. See messages above.")
+    }
+
+    cat("All compound names validated successfully\n")
+
+    # --------------------------------------------------------------------------
+    # STEP 4: Calculate RT adjustments
+    #
+    # Logic:
+    #   - Left-join observed R.Time onto the full 92-compound reference table.
+    #     Compounds absent from the input file will have NA in R.Time after join.
+    #   - For matched compounds: adjustment = round(observed R.Time - OldMid)
+    #                            New Rt MIN  = OldMin + adjustment
+    #                            New Rt MAX  = OldMax + adjustment
+    #   - For unmatched compounds: all new values set to 0 (signals Python to skip)
+    #
+    # Column layout (A-M) is fixed — Python identifies columns by header string:
+    #   A  Name             — Python reads compound names here
+    #   B  OldMin           — baseline window lower bound (reference, not read by Python)
+    #   C  OldMax           — baseline window upper bound (reference, not read by Python)
+    #   D  DRt              — window width (reference, not read by Python)
+    #   E  OldMid           — baseline midpoint (reference, not read by Python)
+    #   F  New Adjustment   — shift applied (seconds)
+    #   G  R.Time           — observed RT from input (0 if compound absent)
+    #   H  RtMID - R.Time   — difference between new midpoint and observed RT
+    #   I  Adjustment (s)   — duplicate of F for display consistency
+    #   J  New Rt MIN       — Python reads this (searches for "RT" + "MIN")
+    #   K  New Rt MAX       — Python reads this (searches for "RT" + "MAX")
+    #   L  New Rt MID       — new window midpoint
+    #   M  New RtMID - R.Time — verification: should be near 0 for matched compounds
+    # --------------------------------------------------------------------------
+    cat("Calculating RT adjustments...\n")
+
+    output_data <- ref_compounds %>%
+
+      # Left join: keeps all 92 reference rows; adds R.Time where matched
+      left_join(compound_data, by = "Name") %>%
+
+      mutate(
+
+        # Shift = difference between observed RT and baseline midpoint, rounded
+        # to nearest integer second. NA (absent compound) -> 0.
+        `New Adjustment` = if_else(
+          !is.na(R.Time),
+          round(R.Time - OldMid),
+          0
+        ),
+
+        # New window lower bound: shift baseline min by the adjustment
+        `New Rt MIN` = if_else(
+          !is.na(R.Time),
+          OldMin + `New Adjustment`,
+          0   # 0 tells Python to skip this compound
+        ),
+
+        # New window upper bound: shift baseline max by the adjustment
+        `New Rt MAX` = if_else(
+          !is.na(R.Time),
+          OldMax + `New Adjustment`,
+          0   # 0 tells Python to skip this compound
+        ),
+
+        # New midpoint: average of new min and max
+        `New Rt MID` = if_else(
+          !is.na(R.Time),
+          (`New Rt MIN` + `New Rt MAX`) / 2,
+          0
+        ),
+
+        # Replace NA R.Time (absent compounds) with 0 for clean output
+        R.Time = if_else(is.na(R.Time), 0, R.Time),
+
+        # Difference between new midpoint and observed RT — should be ~0
+        # for all matched compounds (non-zero indicates rounding)
+        `RtMID - R.Time` = `New Rt MID` - R.Time,
+
+        # Duplicate adjustment column — kept for display consistency with
+        # the original file format
+        `Adjustment (s)` = `New Adjustment`,
+
+        `New RtMID - R.Time` = `New Rt MID` - R.Time
+
+      ) %>%
+
+      # Reorder columns to match the expected A-M layout (see header above)
+      select(
+        Name,                  # A
+        OldMin,                # B
+        OldMax,                # C
+        DRt,                   # D
+        OldMid,                # E
+        `New Adjustment`,      # F
+        R.Time,                # G
+        `RtMID - R.Time`,      # H
+        `Adjustment (s)`,      # I
+        `New Rt MIN`,          # J — Python reads this
+        `New Rt MAX`,          # K — Python reads this
+        `New Rt MID`,          # L
+        `New RtMID - R.Time`   # M
+      )
+
+    # Count how many compounds had an adjustment applied (non-zero shift)
+    compounds_found <- sum(output_data$`New Adjustment` != 0)
+    cat("Compounds with RT adjustments:", compounds_found, "\n")
+    cat("Compounds set to 0 (absent from input):",
+        nrow(output_data) - compounds_found, "\n")
+
+    # --------------------------------------------------------------------------
+    # STEP 5: Verify output structure
+    # Python will fail silently if row count or first compound are wrong,
+    # so we check here and stop with a clear message if something is off.
+    # --------------------------------------------------------------------------
+    cat("\nVerifying output structure...\n")
+    cat("  Total rows:", nrow(output_data), "(expected: 92)\n")
+    cat("  First compound:", output_data$Name[1], "(expected: ACETALDEHYDE)\n")
+    cat("  Last compound: ", output_data$Name[nrow(output_data)], "\n")
+
+    if (nrow(output_data) != 92) {
+      stop("Output has ", nrow(output_data), " rows but must have exactly 92. ",
+           "Check the reference table for duplicate or missing entries.")
+    }
+
+    if (output_data$Name[1] != "ACETALDEHYDE") {
+      stop("First compound is '", output_data$Name[1],
+           "' but must be ACETALDEHYDE. ",
+           "Do not reorder the reference table.")
+    }
+
+    cat("Output structure validated\n")
+
+    # All checks passed — update result to success
+    result$success         <- TRUE
+    result$compounds_found <- compounds_found
+    result$output_data     <- output_data
+
+  }, error = function(e) {
+    # Store the error message and return; the loop will continue to the next file
+    result$error <<- conditionMessage(e)
+    cat("\n*** ERROR:", conditionMessage(e), "\n")
+  })
+
+  return(result)
+}
+
+
+# ==============================================================================
+# FUNCTION 3: write_output_file()
+#
+# Writes a processed 92-row output tibble to an Excel file with the exact row
+# placement required by the Python MethodManager script:
+#   Row 1-2: Empty (NA)
+#   Row 3:   Column headers (written as data, not as R's default header row)
+#   Row 4-7: Empty (NA)
+#   Row 8-99: The 92 compound data rows
+#
+# This structure is achieved by building a single flat data frame where the
+# header row is inserted as a data row, then writing with col_names = FALSE
+# to suppress R's automatic header. All values are coerced to character first
+# to prevent type conflicts when binding rows of mixed numeric/character data.
+#
+# Why writexl, not openxlsx?
+#   openxlsx adds a drawing XML element that causes errors when the file is
+#   later read by Python's openpyxl library. writexl produces a clean file.
+#
+# Arguments:
+#   output_data     the 92-row tibble returned by process_file()
+#   input_file_path full path to the original input file (used for naming)
+#   output_dir      folder to write the output file into
+#
+# Returns the full path of the written output file.
+# ==============================================================================
+
+write_output_file <- function(output_data, input_file_path, output_dir) {
+
+  # Derive output filename by appending "_all" to the input filename stem
+  # e.g. C6C12_2024_03_15.xlsx -> C6C12_2024_03_15_all.xlsx
+  input_stem  <- tools::file_path_sans_ext(basename(input_file_path))
+  output_name <- paste0(input_stem, "_all.xlsx")
+  output_path <- file.path(output_dir, output_name)
+
+  cat("\nWriting output file...\n")
+  cat("  Path:", output_path, "\n")
+
+  # --------------------------------------------------------------------------
+  # Convert all columns to character before binding rows of different types.
+  # numeric + character bind will coerce silently and may corrupt values.
+  # --------------------------------------------------------------------------
+  output_char <- output_data %>%
+    mutate(across(everything(), as.character))
+
+  n_cols    <- ncol(output_char)
+  col_names <- names(output_char)   # The actual column name strings (A-M labels)
+
+  # Helper to create a block of empty (NA) rows with the same column structure
+  make_empty_rows <- function(n) {
+    as.data.frame(
+      matrix(NA_character_, nrow = n, ncol = n_cols),
+      stringsAsFactors = FALSE
+    ) %>%
+      setNames(col_names)
+  }
+
+  # Build a one-row data frame containing the column names as data values.
+  # This becomes row 3 in the output file, where Python looks for headers.
+  header_row <- as.data.frame(
+    matrix(col_names, nrow = 1, ncol = n_cols),
+    stringsAsFactors = FALSE
+  ) %>%
+    setNames(col_names)
+
+  # Stack all sections into one flat data frame:
+  #   Rows 1-2:  empty
+  #   Row 3:     column names (as data)
+  #   Rows 4-7:  empty
+  #   Rows 8-99: compound data (92 rows)
+  final_data <- bind_rows(
+    make_empty_rows(2),   # Rows 1-2
+    header_row,           # Row 3  — Python reads headers here
+    make_empty_rows(4),   # Rows 4-7
+    output_char           # Rows 8-99
+  )
+
+  # Write to Excel.
+  # col_names = FALSE prevents writexl from adding its own header row above
+  # our manually placed header in row 3.
+  # Sheet is named "C6C12" to match convention; Python does not check sheet name.
+  write_xlsx(
+    x         = list(C6C12 = final_data),
+    path      = output_path,
+    col_names = FALSE
+  )
+
+  cat("  File written successfully\n")
+  cat("  Structure: headers in row 3, compound data in rows 8-99\n")
+
+  return(output_path)
+}
+```
+
+---
+
+## Process All Files
+
+This chunk calls the two processing functions for every file discovered above.
+Results are collected in a summary table for display in the next section.
+
+```{r process_files, echo=TRUE, warning=FALSE, message=FALSE}
+
+# Initialise an empty summary table. One row will be added per input file.
+processing_summary <- tibble(
+  file_name       = character(),
+  success         = logical(),
+  compounds_found = integer(),
+  compounds_total = integer(),
+  error           = character()
+)
+
+# --------------------------------------------------------------------------
+# MAIN PROCESSING LOOP
+# Iterates over every file path found in the file discovery step.
+# process_file() handles its own errors via tryCatch, so a failure on one
+# file will not abort the remaining files.
+# --------------------------------------------------------------------------
+
+for (file_path in all_files) {
+
+  # STEP 1: Read, validate, and compute adjustments
+  result <- process_file(
+    file_path       = file_path,
+    ref_compounds   = ref_compounds,
+    input_sheet     = input_sheet,
+    input_name_col  = input_name_col,
+    input_rtime_col = input_rtime_col
+  )
+
+  # STEP 2: Write output file only if processing succeeded
+  if (result$success) {
+    write_output_file(
+      output_data     = result$output_data,
+      input_file_path = file_path,
+      output_dir      = output_dir
+    )
+  }
+
+  # STEP 3: Append this file's result to the summary table
+  processing_summary <- processing_summary %>%
+    bind_rows(
+      tibble(
+        file_name       = result$file_name,
+        success         = result$success,
+        compounds_found = as.integer(result$compounds_found),
+        compounds_total = as.integer(result$compounds_total),
+        error           = ifelse(is.null(result$error), "", result$error)
+      )
+    )
+}
+
+cat("\n")
+```
+
+---
+
+## Processing Summary
+
+```{r summary, echo=TRUE, warning=FALSE, message=FALSE}
+
+cat("\n")
+cat(paste0(strrep("=", 70), "\n"))
+cat("PROCESSING SUMMARY\n")
+cat(paste0(strrep("=", 70), "\n\n"))
+
+cat("Files processed:", nrow(processing_summary), "\n")
+cat("Successful:     ", sum(processing_summary$success), "\n")
+cat("Failed:         ", sum(!processing_summary$success), "\n\n")
+
+cat("File Details:\n")
+cat(strrep("-", 70), "\n")
+
+for (i in seq_len(nrow(processing_summary))) {
+  row    <- processing_summary[i, ]
+  symbol <- if_else(row$success, "OK", "FAIL")
+
+  cat(sprintf("[%s] %s\n", symbol, row$file_name))
+
+  if (row$success) {
+    cat(sprintf("     Compounds adjusted: %d / %d\n",
+                row$compounds_found, row$compounds_total))
+    cat(sprintf("     Compounds zeroed:   %d / %d\n",
+                row$compounds_total - row$compounds_found, row$compounds_total))
+  } else {
+    cat(sprintf("     ERROR: %s\n", row$error))
+  }
+}
+
+cat(strrep("-", 70), "\n")
+
+# Aggregate statistics across all successful files
+if (sum(processing_summary$success) > 0) {
+  cat("\nAggregate (successful files only):\n")
+  cat("  Total compound slots processed:",
+      sum(processing_summary$compounds_total[processing_summary$success]), "\n")
+  cat("  Total with adjustments applied:",
+      sum(processing_summary$compounds_found[processing_summary$success]), "\n")
+  cat("  Total zeroed out:              ",
+      sum(
+        (processing_summary$compounds_total - processing_summary$compounds_found
+        )[processing_summary$success]
+      ), "\n")
+}
+
+cat("\n")
+cat(paste0(strrep("=", 70), "\n"))
+cat("Output directory:", output_dir, "\n")
+cat(paste0(strrep("=", 70), "\n"))
+```
+
+---
+
+## Python Compatibility Notes
+
+This section documents the output file structure so future users understand
+why the script is formatted the way it is.
+
+### Output file naming
+Input file `C6C12_YYYY_MM_DD.xlsx` → output file `C6C12_YYYY_MM_DD_all.xlsx`,
+saved to the same folder unless `output_dir` is changed.
+
+### Row layout
+
+| Rows   | Contents                                      |
+|--------|-----------------------------------------------|
+| 1-2    | Empty (reserved)                              |
+| 3      | Column headers — Python reads headers here    |
+| 4-7    | Empty (spacer rows expected by Python)        |
+| 8-99   | All 92 C6C12 compounds in reference order     |
+
+### Column layout (A-M)
+
+| Column | Header              | Read by Python? | Notes                              |
+|--------|---------------------|-----------------|------------------------------------|
+| A      | Name                | Yes             | Compound identification            |
+| B      | OldMin              | No              | Baseline window lower bound        |
+| C      | OldMax              | No              | Baseline window upper bound        |
+| D      | DRt                 | No              | Window width                       |
+| E      | OldMid              | No              | Baseline midpoint                  |
+| F      | New Adjustment      | No              | Shift in seconds                   |
+| G      | R.Time              | No              | Observed RT from input             |
+| H      | RtMID - R.Time      | No              | Difference (should be ~0)          |
+| I      | Adjustment (s)      | No              | Duplicate of F                     |
+| J      | New Rt MIN          | Yes             | Python finds via "RT" + "MIN"      |
+| K      | New Rt MAX          | Yes             | Python finds via "RT" + "MAX"      |
+| L      | New Rt MID          | No              | New window midpoint                |
+| M      | New RtMID - R.Time  | No              | Verification column                |
+
+### Why 0 for missing compounds?
+
+Compounds absent from the input file receive `New Rt MIN = 0` and
+`New Rt MAX = 0`. The Python script reads these zeros as a signal to skip
+that compound when updating MethodManager — it will not overwrite existing
+RT windows for compounds that were not observed in this calibration run.
+
+### First compound check
+
+The Python script verifies that row 8 contains `ACETALDEHYDE` before
+proceeding. Do not reorder the reference table in this script.
+
+### Package choice: writexl vs openxlsx
+
+`writexl` is used intentionally. `openxlsx` adds a `xl/drawings/drawing1.xml`
+element to the Excel file that causes errors when Python's `openpyxl` library
+reads the file. `writexl` produces a minimal, clean `.xlsx` that openpyxl
+handles without issue.
+
+---
+
+## Session Info
+
+```{r session_info, echo=TRUE}
+sessionInfo()
+```

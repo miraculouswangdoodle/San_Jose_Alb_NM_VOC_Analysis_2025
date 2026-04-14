@@ -1,0 +1,454 @@
+---
+title: "Vistachrom ASC File Combiner"
+output: html_document
+---
+
+# Dependencies
+
+**Input:** `.Asc` files exported from Vistachrom PeakViewer, located in `data_dir`
+Expected filename format: `YYYYMMDD_to_YYYYMMDD_TYPE_MEASURE.Asc`
+
+**Output:** Combined CSV files written to `output_dir` (`data_dir/output/`):
+
+- `AMB60-A2_Result_combined.csv`
+- `AMB60-MS_Result_combined.csv`
+- `CYL07-A2_RTime_combined.csv`
+- `CYL07-MS_RTime_combined.csv`
+- `CALIB60M_Result_combined.csv`
+- `CALIB60M_RTime_combined.csv`
+- `CALIB-MS_Result_combined.csv`
+- `CALIB-MS_RTime_combined.csv`
+- `ZERO60-2_Result_combined.csv`
+- `ZERO-MS_Result_combined.csv`
+
+---
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+
+# ===== USER PARAMETERS =====
+base_dir  <- ""   # Root directory containing ASC files
+subfolder <- ""   # Optional seasonal subfolder (e.g. "2025" or "Winter"); leave "" if ASC files are directly in base_dir
+
+compound_type <- "C6C12"  # "C2C6" or "C6C12"
+# ===========================
+
+# Derived paths
+data_dir   <- file.path(base_dir, subfolder)
+output_dir <- file.path(data_dir, "output")
+```
+
+# Phase 1: File Discovery & Parsing
+
+```{r file-discovery}
+# Get list of all .Asc files in the directory
+asc_files <- list.files(data_dir, pattern = "\\.Asc$", full.names = TRUE, ignore.case = TRUE)
+
+cat("Found", length(asc_files), "ASC files\n\n")
+
+# Parse filename to extract metadata
+parse_filename <- function(filepath) {
+  filename <- basename(filepath)
+  
+  # Pattern: YYYYMMDD_to_YYYYMMDD_TYPE_MEASURE.Asc
+  pattern <- "^(\\d{8})_to_(\\d{8})_([^_]+)_([^.]+)\\.Asc$"
+  
+  if (str_detect(filename, pattern)) {
+    matches <- str_match(filename, pattern)
+    
+    tibble(
+      filepath   = filepath,
+      filename   = filename,
+      start_date = matches[2],
+      end_date   = matches[3],
+      type       = matches[4],
+      measure    = matches[5],
+      date_range = paste(matches[2], "to", matches[3])
+    )
+  } else {
+    # Return NA row if pattern doesn't match
+    tibble(
+      filepath   = filepath,
+      filename   = filename,
+      start_date = NA_character_,
+      end_date   = NA_character_,
+      type       = NA_character_,
+      measure    = NA_character_,
+      date_range = NA_character_
+    )
+  }
+}
+
+# Create file inventory
+file_inventory <- map_dfr(asc_files, parse_filename)
+
+# Display inventory
+cat("File Inventory:\n")
+print(file_inventory %>% select(filename, type, measure, date_range), n = Inf)
+
+# Check for any files that didn't match the pattern
+unmatched <- file_inventory %>% filter(is.na(type))
+if (nrow(unmatched) > 0) {
+  cat("\n⚠ Warning: The following files did not match the expected naming pattern:\n")
+  print(unmatched$filename)
+}
+
+# Remove unmatched files from inventory
+file_inventory <- file_inventory %>% filter(!is.na(type))
+
+cat("\n", nrow(file_inventory), "files matched the expected pattern\n")
+```
+
+# Phase 2: Read & Parse Files
+
+```{r read-files}
+# Function to read a single ASC file
+# ASC files are tab-delimited with embedded nul characters requiring readLines() + strsplit() parsing
+read_asc_file <- function(filepath, source_label) {
+  tryCatch({
+    # Read raw lines and suppress the nul warnings
+    raw_lines <- suppressWarnings(readLines(filepath, warn = FALSE))
+    
+    if (length(raw_lines) == 0) {
+      stop("File is empty or unreadable")
+    }
+    
+    # Parse tab-delimited data manually
+    split_lines <- strsplit(raw_lines, "\t")
+    
+    # Get column names from first line
+    col_names <- split_lines[[1]]
+    
+    if (length(split_lines) > 1) {
+      # Convert to matrix then data frame
+      data_matrix <- do.call(rbind, split_lines[-1])
+      df <- as.data.frame(data_matrix, stringsAsFactors = FALSE)
+      colnames(df) <- col_names
+      
+      # Convert Sampling date to datetime
+      df <- df %>%
+        mutate(`Sampling date` = as.POSIXct(`Sampling date`,
+                                             format = "%Y/%m/%d %H:%M:%S"))
+      
+      # Convert all other columns to numeric (except Sampling date)
+      numeric_cols <- setdiff(names(df), "Sampling date")
+      df <- df %>%
+        mutate(across(all_of(numeric_cols), as.numeric))
+      
+      # Add source column
+      df <- df %>%
+        mutate(source = source_label, .after = `Sampling date`)
+      
+      return(df)
+    } else {
+      stop("No data rows found after header")
+    }
+    
+  }, error = function(e) {
+    cat("  ✗ Error reading file:", e$message, "\n")
+    return(NULL)
+  })
+}
+
+# Read all files and organize by type and measure
+cat("\nReading files...\n")
+
+all_data <- list()
+
+for (i in 1:nrow(file_inventory)) {
+  row <- file_inventory[i, ]
+  
+  cat("Reading:", row$filename, "\n")
+  
+  df <- read_asc_file(row$filepath, row$date_range)
+  
+  if (!is.null(df)) {
+    type    <- row$type
+    measure <- row$measure
+    
+    if (is.null(all_data[[type]]))           all_data[[type]] <- list()
+    if (is.null(all_data[[type]][[measure]])) all_data[[type]][[measure]] <- list()
+    
+    all_data[[type]][[measure]][[length(all_data[[type]][[measure]]) + 1]] <- df
+    
+    cat("  ✓ Successfully read:", nrow(df), "rows,", ncol(df), "columns\n")
+  }
+  
+  cat("\n")
+}
+
+cat("Finished reading files\n\n")
+
+# Display data structure
+cat("Data structure:\n")
+for (type in names(all_data)) {
+  cat("  ", type, ":\n")
+  for (measure in names(all_data[[type]])) {
+    n_files <- length(all_data[[type]][[measure]])
+    cat("    ", measure, ":", n_files, "file(s)\n")
+  }
+}
+```
+
+# Phase 3: Filter by Interest
+
+```{r filter-data}
+# AMB60-A2, AMB60-MS: Result only
+# CYL07-A2, CYL07-MS: RTime only
+# CALIB60M, CALIB-MS: Result AND RTime
+# ZERO60-2, ZERO-MS:  Result only
+
+cat("\nFiltering data by interest...\n\n")
+
+filtered_data <- list()
+
+# AMB types - Result only
+for (type in c("AMB60-A2", "AMB60-MS")) {
+  if (!is.null(all_data[[type]]) && !is.null(all_data[[type]][["Result"]])) {
+    filtered_data[[type]] <- list()
+    filtered_data[[type]][["Result"]] <- all_data[[type]][["Result"]]
+    cat("✓ Kept", type, "Result:", length(all_data[[type]][["Result"]]), "file(s)\n")
+  }
+}
+
+# CYL07 types - RTime only
+for (type in c("CYL07-A2", "CYL07-MS")) {
+  if (!is.null(all_data[[type]]) && !is.null(all_data[[type]][["RTime"]])) {
+    filtered_data[[type]] <- list()
+    filtered_data[[type]][["RTime"]] <- all_data[[type]][["RTime"]]
+    cat("✓ Kept", type, "RTime:", length(all_data[[type]][["RTime"]]), "file(s)\n")
+  }
+}
+
+# CALIB types - Result AND RTime
+for (type in c("CALIB60M", "CALIB-MS")) {
+  if (!is.null(all_data[[type]])) {
+    filtered_data[[type]] <- list()
+    
+    if (!is.null(all_data[[type]][["Result"]])) {
+      filtered_data[[type]][["Result"]] <- all_data[[type]][["Result"]]
+      cat("✓ Kept", type, "Result:", length(all_data[[type]][["Result"]]), "file(s)\n")
+    }
+    
+    if (!is.null(all_data[[type]][["RTime"]])) {
+      filtered_data[[type]][["RTime"]] <- all_data[[type]][["RTime"]]
+      cat("✓ Kept", type, "RTime:", length(all_data[[type]][["RTime"]]), "file(s)\n")
+    }
+  }
+}
+
+# Zero types - Result only
+for (type in c("ZERO-MS", "ZERO60-2")) {
+  if (!is.null(all_data[[type]]) && !is.null(all_data[[type]][["Result"]])) {
+    filtered_data[[type]] <- list()
+    filtered_data[[type]][["Result"]] <- all_data[[type]][["Result"]]
+    cat("✓ Kept", type, "Result:", length(all_data[[type]][["Result"]]), "file(s)\n")
+  }
+}
+
+cat("\nFiltered data structure:\n")
+for (type in names(filtered_data)) {
+  cat("  ", type, ":\n")
+  for (measure in names(filtered_data[[type]])) {
+    n_files <- length(filtered_data[[type]][[measure]])
+    cat("    ", measure, ":", n_files, "file(s)\n")
+  }
+}
+```
+
+# Phase 4: Combine Files
+
+```{r combine-files}
+cat("\nCombining files within each type+measure...\n\n")
+
+combined_data <- list()
+
+for (type in names(filtered_data)) {
+  combined_data[[type]] <- list()
+  
+  for (measure in names(filtered_data[[type]])) {
+    df_list <- filtered_data[[type]][[measure]]
+    
+    if (length(df_list) > 0) {
+      combined_df <- bind_rows(df_list)
+      combined_data[[type]][[measure]] <- combined_df
+      
+      cat("✓", type, measure, "- Combined", length(df_list), "file(s) into",
+          nrow(combined_df), "total rows\n")
+    }
+  }
+}
+```
+
+# Phase 5: Handle Duplicates
+
+```{r handle-duplicates}
+cat("\nHandling duplicates...\n\n")
+
+final_data <- list()
+
+# AMB duplicates: average non-zero values; keep non-zero when one value is zero
+handle_amb_duplicates <- function(df) {
+  compound_cols <- setdiff(names(df), c("Sampling date", "source"))
+  
+  df_dedup <- df %>%
+    group_by(`Sampling date`) %>%
+    summarise(
+      across(all_of(compound_cols),
+             ~{
+               vals <- .x[!is.na(.x)]
+               if (length(vals) == 0) {
+                 NA_real_
+               } else if (length(vals) == 1) {
+                 vals[1]
+               } else {
+                 zero_vals <- vals == 0
+                 if (all(zero_vals)) {
+                   0
+                 } else if (any(zero_vals)) {
+                   mean(vals[!zero_vals])
+                 } else {
+                   mean(vals)
+                 }
+               }
+             }),
+      .groups = "drop"
+    )
+  
+  return(df_dedup)
+}
+
+for (type in names(combined_data)) {
+  final_data[[type]] <- list()
+  
+  for (measure in names(combined_data[[type]])) {
+    df <- combined_data[[type]][[measure]]
+    
+    n_duplicates <- df %>%
+      group_by(`Sampling date`) %>%
+      filter(n() > 1) %>%
+      nrow()
+    
+    if (str_detect(type, "AMB60")) {
+      # AMB: average duplicates and drop source column
+      df_final <- handle_amb_duplicates(df)
+      cat("✓", type, measure, "- Handled", n_duplicates, "duplicate row(s),",
+          "final:", nrow(df_final), "rows (source column dropped)\n")
+      
+    } else {
+      # CYL07 and CALIB: keep all rows with source column
+      df_final <- df
+      if (n_duplicates > 0) {
+        cat("✓", type, measure, "- Kept", n_duplicates, "duplicate row(s),",
+            "final:", nrow(df_final), "rows (with source column)\n")
+      } else {
+        cat("✓", type, measure, "- No duplicates, final:", nrow(df_final), "rows\n")
+      }
+    }
+    
+    final_data[[type]][[measure]] <- df_final
+  }
+}
+```
+
+# Phase 6: Export to CSV
+
+```{r export-csv}
+cat("\nExporting combined dataframes to CSV...\n\n")
+
+# Create output directory if it doesn't exist
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+exported_files <- c()
+
+for (type in names(final_data)) {
+  for (measure in names(final_data[[type]])) {
+    df <- final_data[[type]][[measure]]
+    
+    output_filename <- paste0(type, "_", measure, "_combined.csv")
+    output_path     <- file.path(output_dir, output_filename)
+    
+    write_csv(df, output_path)
+    
+    cat("✓ Exported:", output_filename, "(", nrow(df), "rows)\n")
+    exported_files <- c(exported_files, output_filename)
+  }
+}
+
+cat("\n")
+cat(rep("=", 80), "\n", sep = "")
+cat("EXPORT COMPLETE\n")
+cat(rep("=", 80), "\n", sep = "")
+cat("Exported", length(exported_files), "CSV files to:\n")
+cat(output_dir, "\n\n")
+cat("Files created:\n")
+cat(paste("  -", exported_files, collapse = "\n"), "\n")
+```
+
+# Summary Statistics
+
+```{r summary-stats}
+cat("\n")
+cat(rep("=", 80), "\n", sep = "")
+cat("SUMMARY STATISTICS\n")
+cat(rep("=", 80), "\n\n", sep = "")
+
+for (type in names(final_data)) {
+  for (measure in names(final_data[[type]])) {
+    df <- final_data[[type]][[measure]]
+    
+    cat(type, "-", measure, "\n")
+    cat("  Rows:", nrow(df), "\n")
+    cat("  Columns:", ncol(df), "\n")
+    cat("  Date range:", format(min(df$`Sampling date`), "%Y-%m-%d %H:%M"), "to",
+        format(max(df$`Sampling date`), "%Y-%m-%d %H:%M"), "\n")
+    
+    if ("source" %in% names(df)) {
+      cat("  Unique sources:", length(unique(df$source)), "\n")
+    }
+    
+    cat("\n")
+  }
+}
+```
+
+# Process Explanation
+
+**Phase 1: File Discovery & Parsing**
+
+- Lists all `.Asc` files in `data_dir`
+- Uses regex to extract metadata from filenames (`YYYYMMDD_to_YYYYMMDD_TYPE_MEASURE.Asc`)
+- Warns about any files that don't match the expected naming pattern
+
+**Phase 2: Read & Parse Files**
+
+- Reads each file using `readLines()` with nul character suppression
+- Manually parses tab-delimited data (splits by `\t`)
+- Converts `Sampling date` to POSIXct datetime; all measurement columns to numeric
+- Adds a `source` column containing the date range from the filename
+- Organizes data in nested list: `all_data[[type]][[measure]]`
+
+**Phase 3: Filter by Interest**
+
+- **AMB60-A2, AMB60-MS**: Result only
+- **CYL07-A2, CYL07-MS**: RTime only
+- **CALIB60M, CALIB-MS**: Result AND RTime
+- **ZERO60-2, ZERO-MS**: Result only
+
+**Phase 4: Combine Files**
+
+- Stacks all dataframes vertically for each type+measure using `bind_rows()`
+
+**Phase 5: Handle Duplicates**
+
+- **AMB files**: Groups by `Sampling date`; averages non-zero values, keeps non-zero when mixed with zero, keeps 0 if all zero. Drops source column.
+- **CYL07 and CALIB files**: Keeps all rows as-is with source column intact
+
+**Phase 6: Export to CSV**
+
+- Creates `output/` subdirectory within `data_dir` if it doesn't exist
+- Exports each combined dataframe as `[TYPE]_[MEASURE]_combined.csv`

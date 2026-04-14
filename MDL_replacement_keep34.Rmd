@@ -1,0 +1,371 @@
+---
+title: "MDL Replacement for Ambient Data"
+output: html_document
+---
+
+## Purpose
+
+This script replaces zero values in ambient VOC measurement data with 1/2 the Method Detection Limit (MDL). Compounds are filtered to those present in both the ambient data and MDL file (intersection-based). The workflow:
+
+1. Load ambient and MDL data
+2. Filter to compounds present in both files
+3. Evaluate zero percentages for reference and quality assessment
+4. Validate column matching between datasets
+5. Replace zeros with 1/2 MDL values (converting units if needed)
+6. Export processed data with summary statistics
+
+---
+
+# Dependencies
+
+**Upstream scripts:** `Combine_processed_data_w0_Claude.Rmd` → `exp_data_comb_Claude.Rmd`
+
+**Input files** (read from `output_dir` = `data_dir/output/`):
+
+- `AMB60_{compound_type}_{subfolder}_combined.csv` — merged ambient data
+
+**MDL reference file:** full path specified by `mdl_file`
+
+**Output files** (written to `output_dir`):
+
+- `AMB60_{compound_type}_{subfolder}_MDLrep_34c.csv` — ambient data with zeros replaced by 1/2 MDL
+
+---
+
+## User Parameters
+
+```{r user-parameters, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+
+# ===== USER PARAMETERS =====
+base_dir      <- ""       # Root directory containing ASC files
+subfolder     <- ""       # Optional seasonal subfolder (e.g. "Winter2425"); leave "" if files are directly in base_dir
+
+compound_type <- "C6C12"  # "C2C6" or "C6C12"
+
+mdl_file      <- ""       # Full path to MDL file
+mdl_units     <- "ppb"    # Units of MDL file: "ppt" or "ppb"
+
+# Zero percentage threshold — for reporting/flagging only, does not affect filtering
+zero_cutoff_percent <- 99.99
+
+# Non-compound columns to exclude from processing
+exclude_cols <- c("Sampling date", "Volume", "NMTHC-EQC6", "source")
+
+# Additional compounds to manually exclude by name (e.g. compounds known to be unreliable)
+# Set to c() to skip manual exclusions
+manual_exclude <- c()
+# ===========================
+
+# Derived paths
+data_dir   <- file.path(base_dir, subfolder)
+output_dir <- file.path(data_dir, "output")
+
+# Derived filenames
+amb_filename    <- paste0("AMB60_", compound_type, "_", subfolder, "_combined.csv")
+output_filename <- paste0("AMB60_", compound_type, "_", subfolder, "_MDLrep_34c.csv")
+
+amb_path    <- file.path(output_dir, amb_filename)
+output_path <- file.path(output_dir, output_filename)
+```
+
+## Load Data
+
+```{r load-data, message=FALSE, warning=FALSE}
+if (!file.exists(amb_path)) stop("Ambient file not found: ", amb_path)
+if (!file.exists(mdl_file)) stop("MDL file not found: ", mdl_file)
+
+cat("Loading ambient file:", amb_filename, "\n")
+amb_data <- read_csv(amb_path, show_col_types = FALSE)
+
+cat("Loading MDL file:", basename(mdl_file), "\n")
+mdl_raw <- read_csv(mdl_file, show_col_types = FALSE)
+
+cat("\nAmbient data dimensions:", nrow(amb_data), "rows x", ncol(amb_data), "columns\n")
+cat("MDL data dimensions:", nrow(mdl_raw), "rows x", ncol(mdl_raw), "columns\n")
+```
+
+## Evaluate Zero Percentages and Filter by MDL
+
+Zero percentages are calculated for reference. Compounds are retained only if present in both the ambient data and the MDL file.
+
+```{r zero-evaluation, message=FALSE, warning=FALSE}
+# Identify compound columns (exclude metadata and manual exclusions)
+compound_cols <- setdiff(names(amb_data), c(exclude_cols, manual_exclude))
+
+cat("Total compound columns:", length(compound_cols), "\n")
+
+# Calculate zero percentages for each compound
+zero_stats <- amb_data %>%
+  select(all_of(compound_cols)) %>%
+  summarise(across(everything(),
+                   ~sum(. == 0, na.rm = TRUE) / n() * 100)) %>%
+  pivot_longer(everything(),
+               names_to = "Compound",
+               values_to = "Zero_Percent")
+
+cat("\n=== Zero Percentage Summary ===\n")
+zero_stats %>% arrange(desc(Zero_Percent)) %>% print(n = Inf)
+
+# Filter to compounds present in both ambient data and MDL file
+mdl_compounds      <- names(mdl_raw)
+compounds_to_keep  <- intersect(compound_cols, mdl_compounds)
+compounds_to_remove <- setdiff(compound_cols, mdl_compounds)
+
+cat("\n=== Filtering Results ===\n")
+cat("Compounds in ambient data:", length(compound_cols), "\n")
+cat("Compounds in MDL file:", length(mdl_compounds), "\n")
+cat("Compounds retained (in both):", length(compounds_to_keep), "\n")
+cat("Compounds removed (not in MDL):", length(compounds_to_remove), "\n")
+if (length(compounds_to_remove) > 0) {
+  cat("Removed compounds:\n")
+  cat(paste("  -", compounds_to_remove, collapse = "\n"), "\n")
+}
+
+# Flag retained compounds with high zero percentages
+zero_stats_kept <- zero_stats %>% filter(Compound %in% compounds_to_keep)
+
+cat("\n=== Zero Percentage Stats for Retained Compounds ===\n")
+cat("Compounds with >", zero_cutoff_percent, "% zeros:",
+    sum(zero_stats_kept$Zero_Percent > zero_cutoff_percent), "\n")
+if (sum(zero_stats_kept$Zero_Percent > zero_cutoff_percent) > 0) {
+  zero_stats_kept %>%
+    filter(Zero_Percent > zero_cutoff_percent) %>%
+    arrange(desc(Zero_Percent)) %>%
+    print(n = Inf)
+}
+
+# Filter ambient data to retained compounds
+amb_filtered <- amb_data %>%
+  select(`Sampling date`, all_of(compounds_to_keep))
+```
+
+## Process MDL Data
+
+```{r process-mdl, message=FALSE, warning=FALSE}
+# Convert to long format
+mdl_processed_all <- mdl_raw %>%
+  pivot_longer(everything(),
+               names_to = "Compound",
+               values_to = "MDL_raw") %>%
+  mutate(
+    MDL_ppb      = if (mdl_units == "ppt") MDL_raw / 1000 else MDL_raw,
+    Half_MDL_ppb = MDL_ppb / 2
+  )
+
+cat("=== MDL Units ===\n")
+cat("Input units:", mdl_units, "\n")
+if (mdl_units == "ppt") cat("MDL values converted from ppt to ppb (÷1000)\n")
+
+cat("\nTotal compounds in MDL file:", nrow(mdl_processed_all), "\n")
+
+# Report compounds in MDL but not in filtered ambient data
+mdl_only_compounds <- setdiff(mdl_processed_all$Compound, compounds_to_keep)
+if (length(mdl_only_compounds) > 0) {
+  cat("\nNOTE: Compounds in MDL but NOT in filtered ambient data (",
+      length(mdl_only_compounds), "):\n")
+  cat(paste("  -", mdl_only_compounds, collapse = "\n"), "\n")
+}
+
+# Filter to matching compounds only
+mdl_processed <- mdl_processed_all %>%
+  filter(Compound %in% compounds_to_keep)
+
+cat("\n=== Processed MDL Values (Matching Compounds Only) ===\n")
+print(mdl_processed, n = Inf)
+```
+
+## Column Matching Validation
+
+```{r column-validation, message=FALSE, warning=FALSE}
+amb_compounds <- compounds_to_keep
+mdl_compounds <- mdl_processed$Compound
+
+in_amb_not_mdl <- setdiff(amb_compounds, mdl_compounds)
+in_mdl_not_amb <- setdiff(mdl_compounds, amb_compounds)
+
+cat("=== Column Matching Validation ===\n")
+cat("Compounds in filtered ambient data:", length(amb_compounds), "\n")
+cat("Compounds in MDL data (filtered):", length(mdl_compounds), "\n")
+
+if (length(in_amb_not_mdl) > 0) {
+  cat("\n*** CRITICAL MISMATCH DETECTED ***\n")
+  cat("Compounds in ambient but NOT in MDL (", length(in_amb_not_mdl), "):\n")
+  cat(paste("  -", in_amb_not_mdl, collapse = "\n"), "\n")
+  stop("*** PROCESSING STOPPED: Ambient compounds missing from MDL file ***\n")
+} else {
+  cat("\n✓ All ambient compound columns have corresponding MDL values\n")
+}
+```
+
+## MDL Replacement
+
+Replace all zero values with 1/2 MDL for each compound.
+
+```{r mdl-replacement, message=FALSE, warning=FALSE}
+amb_replaced <- amb_filtered
+
+replacement_stats <- tibble(
+  Compound          = character(),
+  Zeros_Before      = integer(),
+  Zeros_After       = integer(),
+  Replacements_Made = integer(),
+  Half_MDL_Value    = numeric()
+)
+
+for (compound in mdl_processed$Compound) {
+  half_mdl <- mdl_processed %>%
+    filter(Compound == !!compound) %>%
+    pull(Half_MDL_ppb)
+  
+  zeros_before <- sum(amb_replaced[[compound]] == 0, na.rm = TRUE)
+  
+  amb_replaced[[compound]][amb_replaced[[compound]] == 0] <- half_mdl
+  
+  zeros_after <- sum(amb_replaced[[compound]] == 0, na.rm = TRUE)
+  
+  replacement_stats <- replacement_stats %>%
+    bind_rows(tibble(
+      Compound          = compound,
+      Zeros_Before      = zeros_before,
+      Zeros_After       = zeros_after,
+      Replacements_Made = zeros_before - zeros_after,
+      Half_MDL_Value    = half_mdl
+    ))
+}
+
+cat("=== MDL Replacement Summary ===\n")
+cat("Total replacements made:", sum(replacement_stats$Replacements_Made), "\n\n")
+print(replacement_stats, n = Inf)
+```
+
+## Before/After Statistics
+
+```{r before-after-stats, message=FALSE, warning=FALSE}
+stats_before <- amb_filtered %>%
+  select(-`Sampling date`) %>%
+  summarise(across(everything(),
+                   list(
+                     min    = ~min(., na.rm = TRUE),
+                     mean   = ~mean(., na.rm = TRUE),
+                     median = ~median(., na.rm = TRUE),
+                     max    = ~max(., na.rm = TRUE),
+                     zeros  = ~sum(. == 0, na.rm = TRUE)
+                   ))) %>%
+  pivot_longer(everything(),
+               names_to = c("Compound", "Statistic"),
+               names_sep = "_",
+               values_to = "Before")
+
+stats_after <- amb_replaced %>%
+  select(-`Sampling date`) %>%
+  summarise(across(everything(),
+                   list(
+                     min    = ~min(., na.rm = TRUE),
+                     mean   = ~mean(., na.rm = TRUE),
+                     median = ~median(., na.rm = TRUE),
+                     max    = ~max(., na.rm = TRUE),
+                     zeros  = ~sum(. == 0, na.rm = TRUE)
+                   ))) %>%
+  pivot_longer(everything(),
+               names_to = c("Compound", "Statistic"),
+               names_sep = "_",
+               values_to = "After")
+
+comparison_stats <- stats_before %>%
+  left_join(stats_after, by = c("Compound", "Statistic")) %>%
+  mutate(Change = After - Before) %>%
+  arrange(Compound, Statistic)
+
+cat("=== Before/After Statistics Comparison ===\n")
+print(comparison_stats, n = 50)
+
+cat("\n=== Key Changes ===\n")
+cat("Minimum values changed:",
+    sum(comparison_stats %>% filter(Statistic == "min") %>% pull(Change) != 0),
+    "compounds\n")
+cat("All zeros eliminated:",
+    all(comparison_stats %>% filter(Statistic == "zeros", After == 0) %>% nrow() ==
+        comparison_stats %>% filter(Statistic == "zeros") %>% nrow()), "\n")
+```
+
+## Export Processed Data
+
+```{r export, message=FALSE, warning=FALSE}
+write_csv(amb_replaced, output_path)
+
+cat("=== Export Complete ===\n")
+cat("Output file:", output_filename, "\n")
+cat("Dimensions:", nrow(amb_replaced), "rows x", ncol(amb_replaced), "columns\n")
+cat("Columns: Sampling date +", ncol(amb_replaced) - 1, "compounds\n")
+```
+
+## Summary Report
+
+```{r summary-report, message=FALSE, warning=FALSE}
+cat("\n", paste(rep("=", 60), collapse = ""), "\n")
+cat("                   PROCESSING SUMMARY\n")
+cat(paste(rep("=", 60), collapse = ""), "\n\n")
+
+cat("Subfolder:", subfolder, "\n")
+cat("Compound type:", compound_type, "\n")
+cat("Input file:", amb_filename, "\n")
+cat("Output file:", output_filename, "\n\n")
+
+cat("--- Compound Filtering ---\n")
+cat("Original compound count:", length(compound_cols), "\n")
+cat("Compounds in MDL file:", length(names(mdl_raw)), "\n")
+cat("Compounds removed (not in MDL):", length(compounds_to_remove), "\n")
+cat("Compounds retained (in both files):", length(compounds_to_keep), "\n")
+cat("Note: Zero cutoff (", zero_cutoff_percent, "%) used for flagging only\n\n")
+
+cat("--- MDL Replacement ---\n")
+cat("MDL units (input):", mdl_units, "\n")
+cat("Total zero values replaced:", sum(replacement_stats$Replacements_Made), "\n")
+cat("Compounds with replacements:", sum(replacement_stats$Replacements_Made > 0), "\n")
+cat("MDL source file:", basename(mdl_file), "\n\n")
+
+cat("--- Output ---\n")
+cat("Final dataset dimensions:", nrow(amb_replaced), "rows x", ncol(amb_replaced), "columns\n")
+cat("Date range:", format(min(amb_replaced$`Sampling date`)), "to",
+    format(max(amb_replaced$`Sampling date`)), "\n")
+
+cat("\n", paste(rep("=", 60), collapse = ""), "\n")
+```
+
+## Final Compound Statistics
+
+```{r final-statistics, message=FALSE, warning=FALSE}
+final_stats <- amb_replaced %>%
+  select(-`Sampling date`) %>%
+  summarise(across(everything(),
+                   list(
+                     min    = ~min(., na.rm = TRUE),
+                     q25    = ~quantile(., 0.25, na.rm = TRUE),
+                     median = ~median(., na.rm = TRUE),
+                     mean   = ~mean(., na.rm = TRUE),
+                     q75    = ~quantile(., 0.75, na.rm = TRUE),
+                     max    = ~max(., na.rm = TRUE),
+                     sd     = ~sd(., na.rm = TRUE),
+                     n_obs  = ~sum(!is.na(.))
+                   ))) %>%
+  pivot_longer(everything(),
+               names_to = c("Compound", "Statistic"),
+               names_sep = "_",
+               values_to = "Value") %>%
+  pivot_wider(names_from = Statistic, values_from = Value) %>%
+  arrange(Compound)
+
+cat("=== Final Compound Statistics (After MDL Replacement) ===\n")
+cat("Statistics for", nrow(final_stats), "compounds\n\n")
+print(final_stats, n = Inf)
+
+cat("\n=== Distribution Summary ===\n")
+cat("Compounds with mean > median (right-skewed):",
+    sum(final_stats$mean > final_stats$median, na.rm = TRUE), "\n")
+cat("Compounds with mean < median (left-skewed):",
+    sum(final_stats$mean < final_stats$median, na.rm = TRUE), "\n")
+cat("Average coefficient of variation (SD/Mean):",
+    round(mean(final_stats$sd / final_stats$mean, na.rm = TRUE), 2), "\n")
+```

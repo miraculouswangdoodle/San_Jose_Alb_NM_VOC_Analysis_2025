@@ -1,0 +1,145 @@
+---
+title: "Exported Data Combination"
+output: html_document
+---
+
+# Dependencies
+
+**Upstream script:** `Combine_processed_data_w0_Claude.Rmd`
+
+**Input files** (read from `output_dir` = `data_dir/output/`):
+
+- `AMB60-MS_Result_combined.csv`
+- `AMB60-A2_Result_combined.csv`
+
+**Output files** (written to `output_dir`):
+
+- `AMB60_{compound_type}_{subfolder}_combined.csv` — merged MS + A2 ambient data with source column
+- `AMB60_{compound_type}_{subfolder}_stats.csv` — per-compound statistics broken out by MS, A2, and combined
+
+---
+
+# Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+
+# ===== USER PARAMETERS =====
+base_dir      <- ""       # Root directory containing ASC files
+subfolder     <- ""       # Optional seasonal subfolder (e.g. "Winter2425"); leave "" if files are directly in base_dir
+
+compound_type <- "C6C12"  # "C2C6" or "C6C12"
+# ===========================
+
+# Derived paths
+data_dir   <- file.path(base_dir, subfolder)
+output_dir <- file.path(data_dir, "output")
+```
+
+# Functions
+
+```{r functions}
+# Calculate summary statistics for a dataset, optionally filtered by source
+calculate_stats <- function(data, source_filter = NULL) {
+  
+  if (!is.null(source_filter)) {
+    data <- data %>% filter(source == source_filter)
+  }
+  
+  compound_cols <- setdiff(names(data), c("Sampling date", "source"))
+  
+  stats <- map_dfr(compound_cols, function(compound) {
+    values <- data[[compound]]
+    
+    tibble(
+      compound   = compound,
+      n_total    = length(values),
+      n_zero     = sum(values == 0, na.rm = TRUE),
+      pct_zero   = round(100 * sum(values == 0, na.rm = TRUE) / length(values), 1),
+      mean_all   = round(mean(values, na.rm = TRUE), 3),
+      median_all = round(median(values, na.rm = TRUE), 3),
+      min_all    = round(min(values, na.rm = TRUE), 3),
+      max_all    = round(max(values, na.rm = TRUE), 3)
+    )
+  })
+  
+  return(stats)
+}
+```
+
+# Read Input Files
+
+```{r read-files, message=FALSE, warning=FALSE}
+ms_file <- file.path(output_dir, paste0("AMB60-MS_Result_combined.csv"))
+a2_file <- file.path(output_dir, paste0("AMB60-A2_Result_combined.csv"))
+
+if (!file.exists(ms_file)) stop("MS file not found: ", ms_file)
+if (!file.exists(a2_file)) stop("A2 file not found: ", a2_file)
+
+cat("Reading MS file...\n")
+data_ms <- read_csv(ms_file, show_col_types = FALSE) %>%
+  mutate(source = "MS")
+
+cat("Reading A2 file...\n")
+data_a2 <- read_csv(a2_file, show_col_types = FALSE) %>%
+  mutate(source = "A2")
+
+cat("MS rows:", nrow(data_ms), "\n")
+cat("A2 rows:", nrow(data_a2), "\n")
+```
+
+# Combine Datasets
+
+```{r combine, message=FALSE, warning=FALSE}
+data_combined <- bind_rows(data_ms, data_a2) %>%
+  arrange(`Sampling date`)
+
+cat("Combined rows:", nrow(data_combined), "\n")
+```
+
+# Calculate Statistics
+
+```{r statistics, message=FALSE, warning=FALSE}
+stats_ms  <- calculate_stats(data_combined, "MS")
+stats_a2  <- calculate_stats(data_combined, "A2")
+stats_all <- calculate_stats(data_combined)
+
+# Combine into unified report
+stats_unified <- stats_ms %>%
+  rename_with(~paste0(., "_MS"), -compound) %>%
+  left_join(
+    stats_a2 %>% rename_with(~paste0(., "_A2"), -compound),
+    by = "compound"
+  ) %>%
+  left_join(
+    stats_all %>% rename_with(~paste0(., "_All"), -compound),
+    by = "compound"
+  ) %>%
+  select(compound,
+         starts_with("n_total"), starts_with("n_zero"), starts_with("pct_zero"),
+         starts_with("mean"), starts_with("median"), starts_with("min"), starts_with("max"))
+
+cat("Statistics calculated for", nrow(stats_unified), "compounds\n")
+print(stats_unified, n = Inf)
+```
+
+# Export
+
+```{r export, message=FALSE, warning=FALSE}
+# Create output directory if it doesn't exist
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# Combined data
+combined_filename <- paste0("AMB60_", compound_type, "_", subfolder, "_combined.csv")
+combined_path     <- file.path(output_dir, combined_filename)
+write_csv(data_combined, combined_path)
+cat("Exported combined data:", combined_filename, "(", nrow(data_combined), "rows)\n")
+
+# Statistics report
+stats_filename <- paste0("AMB60_", compound_type, "_", subfolder, "_stats.csv")
+stats_path     <- file.path(output_dir, stats_filename)
+write_csv(stats_unified, stats_path)
+cat("Exported statistics:", stats_filename, "\n")
+
+cat("\nAll files saved to:", output_dir, "\n")
+```

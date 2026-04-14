@@ -1,0 +1,793 @@
+---
+title: "Cylinder ASC Comparison"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+---
+
+## About This Script
+
+This script reads CYL07 ASC files directly from a user-specified folder and produces
+a retention time (RTime) comparison report. It evaluates A2 and MS instrument files
+separately against a reference compound list, compares A2 vs MS result concentrations,
+and checks for data continuity gaps and concentration jumps.
+
+**Required inputs:**
+
+1. A folder containing CYL07 ASC files with names matching the pattern:
+   `YYYYMM_CYL07-A2_Result_airmoVOC C2-C6.Asc` (or `C6-C12`, `MS`, etc.)
+
+2. A reference CSV file (`ID_cyl_peaks.csv`) with a column named `Compound`
+   listing the expected compounds for the cylinder.
+
+**Output:** `rtime_comparison_report.csv` saved to the specified output folder.
+
+---
+
+## User Configuration
+
+> **START HERE.** Set all parameters in this section before knitting.
+
+```{r user_config}
+# ==============================================================================
+# USER INPUTS — edit these values only
+# ==============================================================================
+
+# Full path to the folder containing CYL07 ASC files
+#   Example: "C:/Data/CYL07_files"
+cyl_folder <- "PASTE/YOUR/CYL07/FOLDER/PATH/HERE" # note: use / (not \)
+
+# Full path to the reference compound CSV file (ID_cyl_peaks.csv)
+#   This file must have a column named "Compound"
+#   Example: "C:/Data/ID_cyl_peaks.csv"
+reference_file <- "PASTE/YOUR/REFERENCE/FILE/PATH/HERE" # note: use / (not \)
+
+# Full path to the folder where output files will be saved
+#   Will be created automatically if it does not exist
+output_folder <- cyl_folder # "PASTE/YOUR/OUTPUT/FOLDER/PATH/HERE"  # if you want a different output folder, put that path here
+
+# Compound range being analyzed — must be either "C2C6" or "C6C12"
+compound_type <- "C6C12"
+
+# Percent difference threshold for flagging A2 vs MS result comparisons
+#   Pairs where abs(A2 - MS) / mean(A2, MS) * 100 exceeds this value are flagged
+pct_diff_threshold <- 10
+
+# Gap threshold: flag sampling gaps longer than this many days
+gap_threshold_days <- 7
+
+# ==============================================================================
+```
+
+---
+
+## Setup
+
+```{r libraries}
+library(tidyverse)
+library(lubridate)
+
+# ---------- Validate compound_type ----------
+if (!compound_type %in% c("C2C6", "C6C12")) {
+  stop(
+    "compound_type must be 'C2C6' or 'C6C12'. Current value: ", compound_type
+  )
+}
+
+# ---------- Map compound_type to the suffix used in ASC filenames ----------
+# ASC filenames use "C2-C6" or "C6-C12" (with hyphens), not "C2C6" / "C6C12"
+asc_suffix <- if (compound_type == "C2C6") "C2-C6" else "C6-C12"
+
+# ---------- Create output folder if needed ----------
+if (!dir.exists(output_folder)) {
+  dir.create(output_folder, recursive = TRUE)
+  cat("Created output folder:", output_folder, "\n")
+}
+
+# ---------- Path validation ----------
+if (!dir.exists(cyl_folder)) {
+  stop("CYL07 folder not found: ", cyl_folder)
+}
+if (!file.exists(reference_file)) {
+  stop("Reference file not found: ", reference_file)
+}
+
+cat("CYL folder:       ", cyl_folder, "\n")
+cat("Reference file:   ", reference_file, "\n")
+cat("Output folder:    ", output_folder, "\n")
+cat("Compound type:    ", compound_type, "(ASC suffix:", asc_suffix, ")\n")
+cat("% diff threshold:", pct_diff_threshold, "%\n")
+cat("Gap threshold:    ", gap_threshold_days, "days\n\n")
+```
+
+---
+
+## Helper Functions
+
+```{r helper_read_asc}
+# ------------------------------------------------------------------------------
+# read_asc_file()
+#
+# Reads a single ASC file (tab-delimited export from Vistachrom).
+# Uses read_delim() with all columns read as character to avoid type coercion
+# issues. Removes completely empty rows.
+#
+# Args:
+#   filepath  : Full path to the .Asc file
+#
+# Returns:
+#   A tibble with all columns as character, or NULL if the file does not exist.
+# ------------------------------------------------------------------------------
+
+read_asc_file <- function(filepath) {
+
+  if (!file.exists(filepath)) {
+    return(NULL)
+  }
+
+  # Use readLines with suppressed warnings to handle embedded null characters,
+  # which cause read_delim() to fail on some Vistachrom ASC exports.
+  raw_lines <- suppressWarnings(readLines(filepath, encoding = "UTF-8"))
+
+  # Remove completely empty lines
+  raw_lines <- raw_lines[nzchar(raw_lines)]
+
+  if (length(raw_lines) < 2) {
+    warning("File appears empty or has only a header: ", filepath)
+    return(NULL)
+  }
+
+  # Split each line on tab to get fields
+  split_lines <- strsplit(raw_lines, "\t")
+
+  # Use the first line as column names
+  col_names <- split_lines[[1]]
+  data_rows  <- split_lines[-1]
+
+  # Pad or trim rows to match the number of column names
+  n_cols <- length(col_names)
+  data_rows <- lapply(data_rows, function(row) {
+    length(row) <- n_cols  # shorter rows get NA; longer rows get truncated
+    row
+  })
+
+  # Build tibble — all columns as character to match read_delim() behavior
+  data <- as_tibble(
+    do.call(rbind, data_rows),
+    .name_repair = "minimal"
+  )
+  names(data) <- col_names
+
+  # Drop rows where every column is NA
+  data <- data %>% filter(!if_all(everything(), is.na))
+
+  return(data)
+}
+```
+
+```{r helper_parse_filenames}
+# ------------------------------------------------------------------------------
+# parse_cyl_filenames()
+#
+# Scans the CYL folder for ASC files matching either of two supported naming
+# patterns and extracts instrument and data type from each filename.
+#
+# Supported patterns:
+#   Pattern 1 (monthly export):
+#     YYYYMM_CYL07-{A2|MS}_{Result|RTime|Area}_airmoVOC {suffix}.Asc
+#     e.g.: 202508_CYL07-A2_Result_airmoVOC C2-C6.Asc
+#
+#   Pattern 2 (date-range export):
+#     YYYYMMDD_to_YYYYMMDD_CYL07-{A2|MS}_{Result|RTime|Area}.Asc
+#     e.g.: 20250804_to_20250814_CYL07-A2_Result.Asc
+#     Files in this format are assumed to match the user-specified compound_type.
+#
+# Both patterns can coexist in the same folder; all matching files are returned.
+#
+# Args:
+#   folder     : Path to the folder containing CYL07 ASC files
+#   asc_suffix : "C2-C6" or "C6-C12" — used to filter pattern 1 files only
+#
+# Returns:
+#   A tibble with columns: filepath, filename, instrument, data_type
+# ------------------------------------------------------------------------------
+
+parse_cyl_filenames <- function(folder, asc_suffix) {
+
+  # List all .Asc files in the folder (case-insensitive extension)
+  all_files <- list.files(folder, pattern = "\\.Asc$", full.names = TRUE,
+                          ignore.case = TRUE)
+
+  if (length(all_files) == 0) {
+    stop("No .Asc files found in folder: ", folder)
+  }
+
+  filenames <- basename(all_files)
+
+  # ---------- Pattern 1: YYYYMM_CYL07-{inst}_{type}_airmoVOC {suffix}.Asc ----------
+  pattern1 <- paste0(
+    "^\\d{6}",                         # YYYYMM (not captured)
+    "_(CYL07-(?:A2|MS))",               # group 1: instrument
+    "_(Result|RTime|Area)",              # group 2: data type
+    "_airmoVOC ",
+    gsub("-", "\\\\-", asc_suffix), # compound suffix, hyphens escaped
+    "\\.Asc$"
+  )
+
+  matches1 <- str_match(filenames, pattern1)
+  valid1   <- !is.na(matches1[, 1])
+
+  # ---------- Pattern 2: YYYYMMDD_to_YYYYMMDD_CYL07-{inst}_{type}.Asc ----------
+  pattern2 <- paste0(
+    "^\\d{8}_to_\\d{8}",   # date range prefix (not captured)
+    "_(CYL07-(?:A2|MS))",      # group 1: instrument
+    "_(Result|RTime|Area)",     # group 2: data type
+    "\\.Asc$"
+  )
+
+  matches2 <- str_match(filenames, pattern2)
+  valid2   <- !is.na(matches2[, 1])
+
+  # ---------- Check that at least one file matched either pattern ----------
+  if (sum(valid1) == 0 && sum(valid2) == 0) {
+    stop(
+      "No matching CYL07 ASC files found in folder: ", folder,
+      "\nExpected one of:\n",
+      "  Pattern 1: YYYYMM_CYL07-A2_Result_airmoVOC ", asc_suffix, ".Asc\n",
+      "  Pattern 2: YYYYMMDD_to_YYYYMMDD_CYL07-A2_Result.Asc\n",
+      "Check compound_type setting and filenames."
+    )
+  }
+
+  # ---------- Build results tibble from whichever pattern(s) matched ----------
+  results <- bind_rows(
+    if (sum(valid1) > 0) tibble(
+      filepath   = all_files[valid1],
+      filename   = filenames[valid1],
+      instrument = matches1[valid1, 2],
+      data_type  = matches1[valid1, 3]
+    ),
+    if (sum(valid2) > 0) tibble(
+      filepath   = all_files[valid2],
+      filename   = filenames[valid2],
+      instrument = matches2[valid2, 2],
+      data_type  = matches2[valid2, 3]
+    )
+  )
+
+  cat("Files matched - Pattern 1 (monthly):", sum(valid1),
+      "| Pattern 2 (date-range):", sum(valid2), "\n")
+
+  results
+}
+```
+
+```{r helper_load_data_type}
+# ------------------------------------------------------------------------------
+# load_data_type()
+#
+# For a given data type ("Result", "RTime", or "Area"), reads all matching ASC
+# files from the parsed file index, parses the datetime column, and combines
+# them into a single long-format tibble with an instrument column.
+#
+# Args:
+#   file_index  : Tibble produced by parse_cyl_filenames()
+#   type        : One of "Result", "RTime", "Area"
+#
+# Returns:
+#   A tibble with columns: instrument, datetime, Sampling date (raw), Volume,
+#   and one column per compound (as character).
+# ------------------------------------------------------------------------------
+
+load_data_type <- function(file_index, type) {
+
+  # Filter index to the requested data type
+  subset_index <- file_index %>% filter(data_type == type)
+
+  if (nrow(subset_index) == 0) {
+    warning("No ", type, " files found in the file index.")
+    return(NULL)
+  }
+
+  results <- list()
+
+  for (i in seq_len(nrow(subset_index))) {
+
+    row  <- subset_index[i, ]
+    data <- read_asc_file(row$filepath)
+
+    if (is.null(data)) {
+      warning("Could not read file: ", row$filename)
+      next
+    }
+
+    # Add instrument identifier as the first column
+    data <- data %>%
+      mutate(instrument = row$instrument, .before = 1)
+
+    results[[i]] <- data
+  }
+
+  if (length(results) == 0) {
+    warning("No ", type, " files could be read.")
+    return(NULL)
+  }
+
+  # Combine all files for this data type
+  bind_rows(results)
+}
+```
+
+---
+
+## Step 1: Discover ASC Files
+
+```{r discover_files}
+# Scan the CYL folder and parse metadata from filenames
+file_index <- parse_cyl_filenames(cyl_folder, asc_suffix)
+
+cat("Files found matching compound type '", asc_suffix, "':\n\n", sep = "")
+
+file_index %>%
+  select(filename, instrument, data_type) %>%
+  arrange(instrument, data_type, filename) %>%
+  print(n = Inf)
+
+cat("\nInstruments detected:", paste(unique(file_index$instrument), collapse = ", "), "\n")
+cat("Data types detected: ", paste(unique(file_index$data_type),  collapse = ", "), "\n\n")
+```
+
+---
+
+## Step 2: Load Reference Compounds
+
+```{r load_reference}
+# Read the reference compound list from ID_cyl_peaks.csv.
+# The file must contain a column named "Compound".
+
+reference_raw <- read_csv(reference_file, show_col_types = FALSE)
+
+if (!"Compound" %in% names(reference_raw)) {
+  stop(
+    "Reference file must contain a column named 'Compound'.\n",
+    "Columns found: ", paste(names(reference_raw), collapse = ", ")
+  )
+}
+
+reference_list <- reference_raw$Compound
+
+cat("Reference compounds loaded (", length(reference_list), "):\n", sep = "")
+cat(paste(reference_list, collapse = ", "), "\n\n")
+```
+
+---
+
+## Step 3: Load ASC Data
+
+```{r load_asc_data}
+# Load all RTime and Result files from the file index.
+# Each data type is combined across all months and both instruments.
+
+cat("Loading RTime files...\n")
+all_rtime <- load_data_type(file_index, "RTime")
+
+cat("\nLoading Result files...\n")
+all_result <- load_data_type(file_index, "Result")
+
+# ---------- Validate ----------
+if (is.null(all_rtime)) stop("No RTime data could be loaded. Check file names and folder.")
+if (is.null(all_result)) stop("No Result data could be loaded. Check file names and folder.")
+
+cat("\nRTime rows loaded: ", nrow(all_rtime),  "\n")
+cat("Result rows loaded:", nrow(all_result), "\n\n")
+```
+
+---
+
+## Step 4: RTime Comparison — Each Instrument vs Reference List
+
+This section evaluates each instrument (A2 and MS) independently. For every
+sampling row, it checks which expected compounds are present (RTime > 0),
+which are absent, and which detections were not in the reference list.
+
+```{r rtime_comparison}
+# ---------- Identify compound columns ----------
+# Exclude known metadata columns; everything else is a compound
+metadata_cols <- c("instrument", "Sampling date", "source", "Volume")
+
+compound_cols <- setdiff(names(all_rtime), metadata_cols)
+cat("Compound columns found in RTime data:", length(compound_cols), "\n\n")
+
+# ---------- Replace NA with 0 in compound columns ----------
+all_rtime <- all_rtime %>%
+  mutate(across(all_of(compound_cols), ~ replace_na(as.numeric(.x), 0)))
+
+# ---------- Row-wise comparison against reference list ----------
+# For each row (one sampling event per instrument):
+#   - present_compounds      : compounds where RTime > 0
+#   - absent_compounds       : compounds where RTime == 0
+#   - expected_and_present   : reference compounds that were detected
+#   - unexpected_and_present : detected compounds NOT in the reference list
+#   - expected_but_absent    : reference compounds that were NOT detected
+
+comparison_results <- all_rtime %>%
+  select(instrument, sampling_date = `Sampling date`,
+         all_of(compound_cols)) %>%
+  rowwise() %>%
+  mutate(
+    analysis = list({
+      row_data <- pick(all_of(compound_cols))
+
+      present_compounds      <- names(row_data)[row_data > 0]
+      absent_compounds       <- names(row_data)[row_data == 0]
+
+      expected_and_present   <- intersect(present_compounds, reference_list)
+      unexpected_and_present <- setdiff(present_compounds,   reference_list)
+      expected_but_absent    <- intersect(absent_compounds,  reference_list)
+
+      tibble(
+        total_compounds_in_data      = length(compound_cols),
+        compounds_with_values        = length(present_compounds),
+        expected_compounds_present   = length(expected_and_present),
+        unexpected_compounds_present = length(unexpected_and_present),
+        expected_compounds_missing   = length(expected_but_absent),
+        perfect_match = (length(unexpected_and_present) == 0) &
+                        (length(expected_but_absent)    == 0),
+        unexpected_list = ifelse(
+          length(unexpected_and_present) > 0,
+          paste(unexpected_and_present, collapse = "; "),
+          NA_character_
+        ),
+        missing_list = ifelse(
+          length(expected_but_absent) > 0,
+          paste(expected_but_absent, collapse = "; "),
+          NA_character_
+        )
+      )
+    })
+  ) %>%
+  ungroup() %>%
+  unnest(analysis)
+
+cat("RTime comparison complete.\n\n")
+```
+
+---
+
+## Step 5: RTime Summary
+
+```{r rtime_summary}
+cat("=== OVERALL SUMMARY ===\n\n")
+cat("Total sampling rows analyzed:", nrow(comparison_results), "\n")
+cat("Instruments analyzed:        ", paste(unique(comparison_results$instrument), collapse = ", "), "\n")
+cat("Reference compounds:         ", length(reference_list), "\n")
+cat("Compound columns in data:    ", length(compound_cols), "\n\n")
+
+# ---------- Perfect match rate by instrument ----------
+cat("=== PERFECT MATCH SUMMARY ===\n\n")
+perfect_match_summary <- comparison_results %>%
+  group_by(instrument) %>%
+  summarise(
+    total_samples   = n(),
+    perfect_matches = sum(perfect_match),
+    pct_perfect     = round(100 * perfect_matches / total_samples, 1),
+    .groups = "drop"
+  )
+print(perfect_match_summary)
+cat("\n")
+
+# ---------- Average compound counts by instrument ----------
+cat("=== COMPOUND PRESENCE SUMMARY ===\n\n")
+compound_summary <- comparison_results %>%
+  group_by(instrument) %>%
+  summarise(
+    avg_compounds_with_values = round(mean(compounds_with_values), 1),
+    avg_expected_present      = round(mean(expected_compounds_present), 1),
+    avg_unexpected_present    = round(mean(unexpected_compounds_present), 1),
+    avg_expected_missing      = round(mean(expected_compounds_missing), 1),
+    .groups = "drop"
+  )
+print(compound_summary)
+cat("\n")
+
+# ---------- Most common unexpected detections ----------
+cat("=== MOST COMMON UNEXPECTED COMPOUNDS ===\n\n")
+unexpected_compounds <- comparison_results %>%
+  filter(!is.na(unexpected_list)) %>%
+  separate_rows(unexpected_list, sep = "; ") %>%
+  count(instrument, unexpected_list, sort = TRUE) %>%
+  rename(compound = unexpected_list, occurrences = n)
+
+if (nrow(unexpected_compounds) > 0) {
+  print(unexpected_compounds)
+} else {
+  cat("No unexpected compounds found.\n")
+}
+cat("\n")
+
+# ---------- Most common missing expected compounds ----------
+cat("=== MOST COMMON MISSING COMPOUNDS ===\n\n")
+missing_compounds <- comparison_results %>%
+  filter(!is.na(missing_list)) %>%
+  separate_rows(missing_list, sep = "; ") %>%
+  count(instrument, missing_list, sort = TRUE) %>%
+  rename(compound = missing_list, occurrences = n)
+
+if (nrow(missing_compounds) > 0) {
+  print(missing_compounds)
+} else {
+  cat("No missing expected compounds found.\n")
+}
+cat("\n")
+```
+
+---
+
+## Step 6: Detailed RTime Results by Instrument
+
+```{r rtime_detailed}
+# Print a detailed breakdown for each instrument showing which sampling rows
+# had mismatches against the reference list.
+
+for (instr in sort(unique(comparison_results$instrument))) {
+
+  cat("\n", strrep("=", 80), "\n", sep = "")
+  cat("DETAILED RESULTS FOR:", instr, "\n")
+  cat(strrep("=", 80), "\n\n", sep = "")
+
+  instr_results <- comparison_results %>% filter(instrument == instr)
+
+  cat("Total samples:       ", nrow(instr_results), "\n")
+  cat("Perfect matches:     ", sum(instr_results$perfect_match), "\n")
+  cat("Samples with issues: ", sum(!instr_results$perfect_match), "\n\n")
+
+  problematic <- instr_results %>%
+    filter(!perfect_match) %>%
+    select(sampling_date,
+           expected_compounds_present,
+           unexpected_compounds_present,
+           expected_compounds_missing,
+           unexpected_list,
+           missing_list)
+
+  if (nrow(problematic) > 0) {
+    cat("SAMPLES WITH MISALIGNMENTS:\n\n")
+    print(problematic, n = Inf)
+  } else {
+    cat("All samples matched the reference perfectly.\n")
+  }
+}
+```
+
+---
+
+## Step 7: Result Comparison — A2 vs MS
+
+This section compares A2 and MS concentrations for shared reference compounds
+on matching dates. Pairs where the symmetric percent difference exceeds the
+threshold are flagged.
+
+```{r result_comparison}
+# ---------- Helper: round datetime to nearest day ----------
+# A2 and MS timestamps may differ by ~1 hour; rounding to day allows matching.
+round_to_day <- function(df) {
+  df %>%
+    mutate(
+      date_raw = ymd_hms(`Sampling date`, truncated = 3),
+      date_day = as_date(round_date(date_raw, unit = "day"))
+    )
+}
+
+# ---------- Helper: pivot Result data to long format ----------
+# Keeps only compounds that appear in the reference list.
+pivot_result_long <- function(df, instrument_id) {
+
+  meta_cols <- c("instrument", "Sampling date", "source", "Volume",
+                 "date_raw", "date_day")
+  comp_cols <- setdiff(names(df), meta_cols)
+
+  # Restrict to reference compounds present in this file
+  ref_cols_present <- intersect(comp_cols, reference_list)
+  missing_ref      <- setdiff(reference_list, comp_cols)
+
+  if (length(missing_ref) > 0) {
+    cat("[", instrument_id, "] Reference compounds not in Result file: ",
+        paste(missing_ref, collapse = ", "), "\n")
+  }
+
+  df %>%
+    # Convert compound columns to numeric before pivoting
+    mutate(across(all_of(ref_cols_present), as.numeric)) %>%
+    select(instrument, date_day, all_of(ref_cols_present)) %>%
+    pivot_longer(
+      cols      = all_of(ref_cols_present),
+      names_to  = "compound",
+      values_to = "concentration"
+    )
+}
+
+# ---------- Prepare A2 and MS Result data ----------
+# Split all_result by instrument, then round dates and pivot to long format.
+
+a2_result <- all_result %>% filter(instrument == "CYL07-A2")
+ms_result <- all_result %>% filter(instrument == "CYL07-MS")
+
+if (nrow(a2_result) == 0) warning("No A2 Result rows found.")
+if (nrow(ms_result) == 0) warning("No MS Result rows found.")
+
+a2_result_long <- a2_result %>% round_to_day() %>% pivot_result_long("CYL07-A2")
+ms_result_long <- ms_result %>% round_to_day() %>% pivot_result_long("CYL07-MS")
+
+# ---------- Join on date + compound ----------
+result_joined <- inner_join(
+  a2_result_long %>% rename(conc_a2 = concentration) %>% select(-instrument),
+  ms_result_long %>% rename(conc_ms = concentration) %>% select(-instrument),
+  by = c("date_day", "compound")
+)
+
+if (nrow(result_joined) == 0) {
+  cat("WARNING: No matching date/compound pairs found between A2 and MS Result files.\n")
+} else {
+
+  # ---------- Calculate symmetric percent difference ----------
+  # Formula: abs(A2 - MS) / mean(A2, MS) * 100
+  # Skipped (NA) when both values are zero (no meaningful comparison)
+  result_joined <- result_joined %>%
+    mutate(
+      mean_conc = (conc_a2 + conc_ms) / 2,
+      pct_diff  = ifelse(
+        mean_conc == 0, NA_real_,
+        abs(conc_a2 - conc_ms) / mean_conc * 100
+      ),
+      flagged   = !is.na(pct_diff) & pct_diff > pct_diff_threshold
+    )
+
+  # ---------- Print summary ----------
+  cat("=== RESULT COMPARISON: A2 vs MS ===\n\n")
+  cat("Threshold:                  ", pct_diff_threshold, "% difference\n")
+  cat("Matched date/compound pairs:", nrow(result_joined), "\n")
+  cat("Pairs skipped (both = 0):  ", sum(is.na(result_joined$pct_diff)), "\n")
+  cat("Flagged pairs (>", pct_diff_threshold, "% diff):",
+      sum(result_joined$flagged, na.rm = TRUE), "\n\n")
+
+  flagged_results <- result_joined %>%
+    filter(flagged) %>%
+    arrange(desc(pct_diff))
+
+  if (nrow(flagged_results) > 0) {
+    cat("--- FLAGGED PAIRS (sorted by % difference) ---\n\n")
+    print(
+      flagged_results %>%
+        mutate(across(c(conc_a2, conc_ms, mean_conc, pct_diff), ~ round(.x, 4))),
+      n = Inf
+    )
+    cat("\n")
+
+    cat("--- MOST FREQUENTLY FLAGGED COMPOUNDS ---\n\n")
+    flag_freq <- flagged_results %>%
+      count(compound, sort = TRUE) %>%
+      rename(times_flagged = n) %>%
+      mutate(pct_of_dates = round(
+        100 * times_flagged / n_distinct(result_joined$date_day), 1
+      ))
+    print(flag_freq)
+    cat("\n")
+  } else {
+    cat("No pairs exceeded the", pct_diff_threshold, "% threshold.\n\n")
+  }
+}
+```
+
+---
+
+## Step 8: Continuity Check
+
+This section checks for unexpected gaps between sampling dates and large
+concentration jumps between consecutive measurements. Each instrument is
+evaluated separately.
+
+```{r continuity_check}
+# ---------- Combine long Result data from both instruments ----------
+all_result_long <- bind_rows(a2_result_long, ms_result_long) %>%
+  arrange(instrument, compound, date_day)
+
+# ---------- Gap detection ----------
+# Flag consecutive measurements separated by more than gap_threshold_days.
+gap_flags <- all_result_long %>%
+  group_by(instrument, compound) %>%
+  arrange(date_day, .by_group = TRUE) %>%
+  mutate(
+    prev_date   = lag(date_day),
+    days_since  = as.numeric(date_day - prev_date),
+    gap_flagged = !is.na(days_since) & days_since > gap_threshold_days
+  ) %>%
+  ungroup() %>%
+  filter(gap_flagged) %>%
+  select(instrument, compound,
+         gap_start = prev_date, gap_end = date_day, days_gap = days_since)
+
+cat("=== CONTINUITY CHECK: DATE GAPS ===\n\n")
+cat("Gap threshold:", gap_threshold_days, "days\n\n")
+
+if (nrow(gap_flags) > 0) {
+  cat("Gaps detected:\n\n")
+  print(gap_flags %>% arrange(instrument, compound, gap_start), n = Inf)
+} else {
+  cat("No gaps exceeding", gap_threshold_days, "days detected.\n")
+}
+cat("\n")
+
+# ---------- Concentration jump detection ----------
+# Flag consecutive measurements where the symmetric % change exceeds the
+# pct_diff_threshold (reuses the same threshold as the A2 vs MS comparison).
+jump_flags <- all_result_long %>%
+  group_by(instrument, compound) %>%
+  arrange(date_day, .by_group = TRUE) %>%
+  mutate(
+    prev_conc   = lag(concentration),
+    prev_date   = lag(date_day),
+    mean_consec = (concentration + prev_conc) / 2,
+    pct_change  = ifelse(
+      is.na(prev_conc) | mean_consec == 0, NA_real_,
+      abs(concentration - prev_conc) / mean_consec * 100
+    ),
+    jump_flagged = !is.na(pct_change) & pct_change > pct_diff_threshold
+  ) %>%
+  ungroup() %>%
+  filter(jump_flagged) %>%
+  select(instrument, compound,
+         date_from = prev_date, conc_from = prev_conc,
+         date_to   = date_day,  conc_to   = concentration,
+         pct_change)
+
+cat("=== CONTINUITY CHECK: CONCENTRATION JUMPS ===\n\n")
+cat("Jump threshold:", pct_diff_threshold,
+    "% change between consecutive measurements\n\n")
+
+if (nrow(jump_flags) > 0) {
+  cat("Concentration jumps detected:\n\n")
+  print(
+    jump_flags %>%
+      mutate(across(c(conc_from, conc_to, pct_change), ~ round(.x, 4))) %>%
+      arrange(instrument, compound, date_from),
+    n = Inf
+  )
+} else {
+  cat("No concentration jumps exceeding", pct_diff_threshold, "% detected.\n")
+}
+cat("\n")
+```
+
+---
+
+## Step 9: Export RTime Comparison Report
+
+```{r export_rtime}
+# Export the RTime comparison results to CSV.
+# One row per sampling event per instrument, with columns summarizing
+# presence/absence of expected and unexpected compounds.
+
+final_comparison <- comparison_results %>%
+  select(
+    instrument,
+    sampling_date,
+    expected_compounds_present,
+    unexpected_compounds_present,
+    expected_compounds_missing,
+    perfect_match,
+    unexpected_list,
+    missing_list
+  )
+
+rtime_export_path <- file.path(output_folder, "rtime_comparison_report.csv")
+write_csv(final_comparison, rtime_export_path)
+
+cat("=== EXPORT COMPLETE ===\n\n")
+cat("RTime comparison report saved to:\n", rtime_export_path, "\n")
+cat("Rows exported:", nrow(final_comparison), "\n")
+```

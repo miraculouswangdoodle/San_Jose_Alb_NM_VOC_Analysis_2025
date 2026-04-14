@@ -1,0 +1,237 @@
+---
+title: "GC MDL Exceedance Analysis"
+output: html_document
+---
+
+# Dependencies
+
+**Upstream script:** `Combine_processed_data_w0_Claude.Rmd`
+
+**Input files** (read from `output_dir` = `data_dir/output/`):
+
+- `ZERO60-2_Result_combined.csv` — C2C6 zero check results
+- `ZERO-MS_Result_combined.csv` — C6C12 zero check results
+
+**MDL reference files** (read from `mdl_c2c6` and `mdl_c6c12` paths); units specified by `mdl_units` parameter ("ppt" or "ppb")
+
+**Output:** None — diagnostic only, results printed to console.
+
+---
+
+## User-Specified Parameters
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(readr)
+library(lubridate)
+
+# ===== USER PARAMETERS =====
+base_dir  <- ""   # Root directory containing ASC files (use / not \)
+subfolder <- ""   # Optional seasonal subfolder (e.g. "Winter2425"); leave "" if files are directly in base_dir
+
+mdl_c2c6  <- ""   # Full path to C2C6 MDL file  (use / not \)
+mdl_c6c12 <- ""   # Full path to C6C12 MDL file (use / not \)
+
+compound_types <- c("C6C12")  # Options: "C2C6", "C6C12", or c("C2C6", "C6C12")
+mdl_units      <- "ppb"       # Units of MDL file: "ppt" or "ppb"
+# ===========================
+
+# Derived paths
+data_dir   <- file.path(base_dir, subfolder)
+output_dir <- file.path(data_dir, "output")
+```
+
+## Process Overview
+
+This analysis compares measured compound values against Method Detection Limits (MDL) to identify any exceedances. The workflow:
+
+1. Load result files from `output_dir` and MDL reference files
+2. Exclude non-compound columns from comparison
+3. Compare each compound measurement against its MDL
+4. Report only instances where measured values exceed MDL
+
+------------------------------------------------------------------------
+
+## C2C6 Analysis
+
+```{r c2c6-analysis, message=FALSE, warning=FALSE}
+if ("C2C6" %in% compound_types) {
+  
+  # Define file path
+  c2c6_result_file <- file.path(output_dir, "ZERO60-2_Result_combined.csv")
+  
+  # Check if files exist
+  if (!file.exists(c2c6_result_file)) {
+    cat("ERROR: C2C6 result file not found at:", c2c6_result_file, "\n")
+    c2c6_exceedances <- NULL
+  } else if (!file.exists(mdl_c2c6)) {
+    cat("ERROR: C2C6 MDL file not found at:", mdl_c2c6, "\n")
+    c2c6_exceedances <- NULL
+  } else {
+    
+    # Read data files
+    c2c6_results <- read_csv(c2c6_result_file, show_col_types = FALSE)
+    c2c6_mdl     <- read_csv(mdl_c2c6, show_col_types = FALSE)
+    
+    # Convert MDL units to ppb if needed (results are in ppb)
+    if (mdl_units == "ppt") {
+      c2c6_mdl <- c2c6_mdl %>% mutate(across(where(is.numeric), ~ .x / 1000))
+      cat("MDL values converted from ppt to ppb (÷1000)\n")
+    }
+    
+    # Columns to exclude from comparison
+    exclude_cols_c2c6 <- c("Sampling date", "source", "Volume", "NMTHC-EQC4")
+    
+    # Get compound columns (all except excluded ones)
+    compound_cols_c2c6 <- setdiff(names(c2c6_results), exclude_cols_c2c6)
+    
+    # Initialize exceedances dataframe
+    c2c6_exceedances <- tibble()
+    
+    for (i in 1:nrow(c2c6_results)) {
+      sampling_date <- c2c6_results$`Sampling date`[i]
+      
+      for (compound in compound_cols_c2c6) {
+        if (!compound %in% names(c2c6_mdl)) next
+        
+        measured_value <- c2c6_results[[compound]][i]
+        mdl_value      <- c2c6_mdl[[compound]][1]  # MDL file has single row
+        
+        if (!is.na(measured_value) && !is.na(mdl_value) && measured_value > mdl_value) {
+          c2c6_exceedances <- c2c6_exceedances %>%
+            bind_rows(tibble(
+              Compound_Type  = "C2C6",
+              Sampling_Date  = sampling_date,
+              Compound       = compound,
+              Measured_Value = measured_value,
+              MDL_Value      = mdl_value,
+              Difference     = measured_value - mdl_value
+            ))
+        }
+      }
+    }
+    
+    cat("\n### C2C6 Results\n\n")
+    cat("Total measurements analyzed:", nrow(c2c6_results) * length(compound_cols_c2c6), "\n")
+    cat("Number of MDL exceedances:", nrow(c2c6_exceedances), "\n\n")
+    
+    if (nrow(c2c6_exceedances) > 0) {
+      cat("MDL Exceedances Found:\n\n")
+      print(c2c6_exceedances, n = Inf)
+    } else {
+      cat("✓ No MDL exceedances detected for C2C6 compounds.\n")
+    }
+  }
+} else {
+  cat("C2C6 analysis skipped (not in compound_types parameter).\n")
+  c2c6_exceedances <- NULL
+}
+```
+
+------------------------------------------------------------------------
+
+## C6C12 Analysis
+
+```{r c6c12-analysis, message=FALSE, warning=FALSE}
+if ("C6C12" %in% compound_types) {
+  
+  # Define file path
+  c6c12_result_file <- file.path(output_dir, "ZERO-MS_Result_combined.csv")
+  
+  # Check if files exist
+  if (!file.exists(c6c12_result_file)) {
+    cat("ERROR: C6C12 result file not found at:", c6c12_result_file, "\n")
+    c6c12_exceedances <- NULL
+  } else if (!file.exists(mdl_c6c12)) {
+    cat("ERROR: C6C12 MDL file not found at:", mdl_c6c12, "\n")
+    c6c12_exceedances <- NULL
+  } else {
+    
+    # Read data files
+    c6c12_results <- read_csv(c6c12_result_file, show_col_types = FALSE)
+    c6c12_mdl     <- read_csv(mdl_c6c12, show_col_types = FALSE)
+    
+    # Convert MDL units to ppb if needed (results are in ppb)
+    if (mdl_units == "ppt") {
+      c6c12_mdl <- c6c12_mdl %>% mutate(across(where(is.numeric), ~ .x / 1000))
+      cat("MDL values converted from ppt to ppb (÷1000)\n")
+    }
+    
+    # Columns to exclude from comparison
+    exclude_cols_c6c12 <- c("Sampling date", "source", "Volume", "NMTHC-EQC6")
+    
+    # Get compound columns (all except excluded ones)
+    compound_cols_c6c12 <- setdiff(names(c6c12_results), exclude_cols_c6c12)
+    
+    # Initialize exceedances dataframe
+    c6c12_exceedances <- tibble()
+    
+    for (i in 1:nrow(c6c12_results)) {
+      sampling_date <- c6c12_results$`Sampling date`[i]
+      
+      for (compound in compound_cols_c6c12) {
+        if (!compound %in% names(c6c12_mdl)) next
+        
+        measured_value <- c6c12_results[[compound]][i]
+        mdl_value      <- c6c12_mdl[[compound]][1]  # MDL file has single row
+        
+        if (!is.na(measured_value) && !is.na(mdl_value) && measured_value > mdl_value) {
+          c6c12_exceedances <- c6c12_exceedances %>%
+            bind_rows(tibble(
+              Compound_Type  = "C6C12",
+              Sampling_Date  = sampling_date,
+              Compound       = compound,
+              Measured_Value = measured_value,
+              MDL_Value      = mdl_value,
+              Difference     = measured_value - mdl_value
+            ))
+        }
+      }
+    }
+    
+    cat("\n### C6C12 Results\n\n")
+    cat("Total measurements analyzed:", nrow(c6c12_results) * length(compound_cols_c6c12), "\n")
+    cat("Number of MDL exceedances:", nrow(c6c12_exceedances), "\n\n")
+    
+    if (nrow(c6c12_exceedances) > 0) {
+      cat("MDL Exceedances Found:\n\n")
+      print(c6c12_exceedances, n = Inf)
+    } else {
+      cat("✓ No MDL exceedances detected for C6C12 compounds.\n")
+    }
+  }
+} else {
+  cat("C6C12 analysis skipped (not in compound_types parameter).\n")
+  c6c12_exceedances <- NULL
+}
+```
+
+------------------------------------------------------------------------
+
+## Combined Summary
+
+```{r combined-summary, message=FALSE, warning=FALSE}
+# Combine all exceedances
+all_exceedances <- bind_rows(c2c6_exceedances, c6c12_exceedances)
+
+if (!is.null(all_exceedances) && nrow(all_exceedances) > 0) {
+  cat("\n### All MDL Exceedances Combined\n\n")
+  cat("Total exceedances across all compound types:", nrow(all_exceedances), "\n\n")
+  
+  exceedance_summary <- all_exceedances %>%
+    group_by(Compound_Type) %>%
+    summarise(
+      Number_of_Exceedances = n(),
+      Unique_Compounds      = n_distinct(Compound),
+      Unique_Dates          = n_distinct(Sampling_Date)
+    )
+  
+  print(exceedance_summary)
+  
+  cat("\n### Detailed Exceedances Table\n\n")
+  print(all_exceedances, n = Inf)
+  
+} else {
+  cat("\n✓ No MDL exceedances detected across all analyzed compound types.\n")
+}
+```
