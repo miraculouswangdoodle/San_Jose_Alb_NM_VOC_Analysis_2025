@@ -29,7 +29,7 @@ Expected filename format: `YYYYMMDD_to_YYYYMMDD_TYPE_MEASURE.Asc`
 library(tidyverse)
 
 # ===== USER PARAMETERS =====
-base_dir  <- ""   # Root directory containing ASC files
+base_dir  <- ""   # Root directory containing ASC files (use / not \)
 subfolder <- ""   # Optional seasonal subfolder (e.g. "2025" or "Winter"); leave "" if ASC files are directly in base_dir
 
 compound_type <- "C6C12"  # "C2C6" or "C6C12"
